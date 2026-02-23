@@ -5,12 +5,13 @@ This module provides functionality to extract and parse bibliographic references
 from PDF files, supporting multiple citation formats (Eurographics, SIGGRAPH, etc.)
 """
 
+import argparse
+import fitz  # PyMuPDF
 import json
 import re
 import time
 from typing import Dict, List, Optional
 
-import fitz  # PyMuPDF
 
 try:
     import requests
@@ -24,6 +25,8 @@ class ReferenceExtractor:
     def __init__(self, pdf_path: str):
         """Initialize the extractor with a PDF file path."""
         self.pdf_path = pdf_path
+        self.document = fitz.open(pdf_path)
+
         self.full_text = self._extract_text()
         self.sections = self._detect_sections()
         self.citation_tag_pattern = None  # Detected citation pattern
@@ -54,7 +57,7 @@ class ReferenceExtractor:
         # Single-column layout
         if spread < page_width * 0.4:
             blocks.sort(key=lambda b: b[1])
-            return "\n".join(b[4] for b in blocks)
+            return "".join(b[4] for b in blocks)
 
         # Multi-column layout
         return self._extract_multicolumn_text(page_width, blocks)
@@ -82,70 +85,95 @@ class ReferenceExtractor:
     # Section Detection
     # ============================================================================
 
+    def _detect_column_starts(self) -> List[float]:
+        """Detect the starting x-coordinates of columns in the document."""
+        x_positions = []
+        for page in self.document:
+            blocks = page.get_text("blocks")
+            for block in blocks:
+                if len(block) >= 5 and block[4].strip():
+                    x_positions.append((block[0], block[2]))  # x0 (start) and x1 (end)
+
+        if not x_positions:
+            return []
+
+        # Group nearby x-positions together (tolerance for rounding/slight variations)
+        tolerance = 5  # Points tolerance for grouping
+        grouped = {}
+        for x, _ in x_positions:
+            # Find if this x belongs to an existing group
+            found_group = False
+            for group_key in grouped.keys():
+                if abs(x - group_key) < tolerance:
+                    grouped[group_key] += 1
+                    found_group = True
+                    break
+            if not found_group:
+                grouped[x] = 1
+
+        # Sort groups by frequency (most common first)
+        sorted_groups = sorted(grouped.items(), key=lambda item: item[1], reverse=True)
+        sorted_groups = [(x, freq / len(x_positions)) for x, freq in sorted_groups if freq / len(x_positions) > 0.1]
+
+        if len(sorted_groups) == 1:
+            return [sorted_groups[0][0]]
+
+        # return the most two frequent x-positions as column starts
+        return [sorted_groups[0][0], sorted_groups[1][0]]
+
     def _detect_sections(self) -> Dict[str, tuple]:
-        """Detect document sections by analyzing PDF structure and extracting headers."""
-        sections = {}
+        """Detect document sections by looping over pages and analyzing text blocks."""
         section_headers = []
+        char_pos = 0
 
-        for line_text in self.full_text.split("\n"):
-            if 1 < len(line_text) < 80:
-                char_pos = self.full_text.find(line_text)
-                if char_pos >= 0:
-                    # Check for numbered sections (1 Title, 2. Title, etc.)
-                    if self._is_likely_section_header(line_text):
-                        section_num = self._extract_section_number(line_text)
-                        section_headers.append({"title": line_text, "position": char_pos, "number": section_num})
-                    # Check for unnumbered Abstract section
-                    elif self._is_abstract_section(line_text):
-                        section_headers.append({"title": line_text, "position": char_pos, "number": None, "is_abstract": True})
-                    # Also check for unnumbered References/Bibliography
-                    elif self._is_references_section(line_text):
-                        section_headers.append({"title": line_text, "position": char_pos, "number": None, "is_references": True})
+        # First pass: detect column starting positions
+        column_starts = self._detect_column_starts()
 
-        # Remove duplicates and sort by position
-        seen = set()
-        unique_headers = []
-        for header in sorted(section_headers, key=lambda x: x["position"]):
-            if header["title"] not in seen:
-                seen.add(header["title"])
-                unique_headers.append(header)
+        # Second pass: identify section headers based on text content and position
+        for page_num, page in enumerate(self.document):
+            blocks = page.get_text("blocks")
+            for block in blocks:
+                # Block tuple: (x0, y0, x1, y1, text, ...)
+                # bbox is first 4 elements, text content is index 4
+                if len(block) >= 5:
+                    x0, y0, x1, y1, text = block[:5]
+                    text = text.replace("\n", " ").strip()
 
-        # Filter to keep Abstract (if present) followed by sections with incrementing numbers by +1
-        # Stop when reaching References or Bibliography
-        filtered_headers = []
-        expected_section_number = 1
-        for header in unique_headers:
-            # Stop if we hit References or Bibliography
-            if header.get("is_references"):
-                break
+                    # Skip empty blocks
+                    if not text:
+                        continue
 
-            # Accept Abstract section at the beginning
-            if header.get("is_abstract"):
-                filtered_headers.append(header)
-                continue
+                    # Check if block looks like a section header
+                    if 5 < len(text) < 100:  # quick heuristic to skip very short or very long blocks
+                        # Check for numbered sections (1 Title, 2. Title, etc.)
+                        if self._is_likely_section_header(text, x0, column_starts):
+                            section_num = self._extract_section_number(text)
+                            clean_title = self._strip_section_number(text)
+                            section_headers.append({"title": clean_title, "position": char_pos, "number": section_num, "page": page_num, "bbox": (x0, y0, x1, y1)})
+                        # Check for unnumbered Abstract section
+                        elif self._is_abstract_section(text):
+                            section_headers.append({"title": text, "position": char_pos, "number": None, "is_abstract": True, "page": page_num, "bbox": (x0, y0, x1, y1)})
+                        # Check for unnumbered References/Bibliography
+                        elif self._is_references_section(text):
+                            section_headers.append({"title": text, "position": char_pos, "number": None, "is_references": True, "page": page_num, "bbox": (x0, y0, x1, y1)})
 
-            # Accept numbered sections in order (1, 2, 3, ...)
-            section_num = header["number"]
-            if section_num == expected_section_number:
-                filtered_headers.append(header)
-                expected_section_number += 1
+                    # Update position counter
+                    char_pos += len(text) + 1
 
-        # Build sections with start/end positions
-        for i, header in enumerate(filtered_headers):
-            start = header["position"]
+        return section_headers
 
-            # Find end: next section header or references
-            if i + 1 < len(filtered_headers):
-                end = filtered_headers[i + 1]["position"]
-            else:
-                ref_section = self._find_references_section()
-                end = self.full_text.find(ref_section) if ref_section else len(self.full_text)
+    def _strip_section_number(self, text: str) -> str:
+        """Remove leading number and optional period from section title.
 
-            sections[header["title"]] = (start, end)
+        Examples:
+        - "1 Introduction" -> "Introduction"
+        - "2. Background" -> "Background"
+        - "3.1 Subsection" -> "3.1 Subsection" (unchanged if subsection)
+        """
+        # Remove leading single-digit section number (optionally with period) followed by whitespace
+        return re.sub(r"^\d+\.?\s+", "", text).strip()
 
-        return sections
-
-    def _is_likely_section_header(self, text: str) -> bool:
+    def _is_likely_section_header(self, text: str, x0: float = None, column_starts: List[float] = None) -> bool:
         """Check if text looks like a section header.
 
         A section should be: number (optionally with period) followed by title
@@ -153,6 +181,8 @@ class ReferenceExtractor:
         - "1. Title" ✓
         - "1.1 Title" ✗ (subsection)
         - "2.3 Title" ✗ (subsection)
+
+        Also checks if the block starts at a column boundary (if column info is available).
         """
         # Match section headers: number optionally followed by period, then space/title
         # Use lookahead to exclude subsections (1.x where x is digit)
@@ -160,6 +190,12 @@ class ReferenceExtractor:
 
         if not re.match(section_pattern, text):
             return False
+
+        # If we have column information, verify the block starts at a column boundary
+        if x0 is not None and column_starts:
+            tolerance = 1  # Points tolerance for matching x0 to column start
+            is_at_column_start = any(abs(x0 - col_start) < tolerance for col_start in column_starts)
+            return is_at_column_start
 
         return True
 
@@ -277,7 +313,7 @@ class ReferenceExtractor:
             "tag": tag,
             "authors": authors,
             "title": title,
-            "rest": rest,
+            # "rest": rest,
             "year": year,
         }
 
@@ -594,16 +630,25 @@ def enrich_references_with_scholar(references: List[Dict], delay: float = 1.0) -
 
 
 def main() -> None:
+    argparser = argparse.ArgumentParser(description="Extract references from a PDF document and save to JSON.")
+    argparser.add_argument("pdf_path", help="Path to the PDF file to process.")
+    argparser.add_argument("-o", "--output", default="output.json", help="Path to save the extracted references JSON.")
+
+    args = argparser.parse_args()
+
     """Main entry point: extract references and save to JSON."""
-    extractor = ReferenceExtractor("test.pdf")
-    references = extractor.extract()
+    extractor = ReferenceExtractor(args.pdf_path)
+    print(extractor.sections)  # Debug: print detected sections
+    with open("text.txt", "w", encoding="utf-8") as f:
+        f.write(extractor.full_text)
+    # references = extractor.extract()
 
     # # Optionally enrich with Semantic Scholar metadata
     # # Uncomment the line below to enable metadata lookup (uses 3s delay per request)
     # references = enrich_references_with_scholar(references)  # Uses default 3s delay
 
-    with open("output.json", "w", encoding="utf-8") as f:
-        json.dump(references, f, indent=2, ensure_ascii=False)
+    # with open(args.output, "w", encoding="utf-8") as f:
+    # json.dump(references, f, indent=2, ensure_ascii=False)
     # data = lookup_google_scholar_metadata("A microfacetbased brdf for the accurate and efficient rendering of high-definition specular normal maps", "2020")
     # print(data)
 
