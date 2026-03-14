@@ -10,7 +10,7 @@ import fitz  # PyMuPDF
 import json
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 try:
@@ -29,7 +29,7 @@ class ReferenceExtractor:
 
         self.full_text = self._extract_text()
         self.sections = self._detect_sections()
-        self.citation_tag_pattern = None  # Detected citation pattern
+        self.section_map = self._build_section_text_map()  # title -> (start, end) in full_text
 
     # ============================================================================
     # Text Extraction
@@ -82,6 +82,51 @@ class ReferenceExtractor:
         return column_text
 
     # ============================================================================
+    # Title Extraction
+    # ============================================================================
+
+    def extract_title(self) -> str:
+        """Extract the paper title from the PDF.
+
+        Strategy:
+        1. PDF metadata (fast, works when the PDF was exported with metadata).
+        2. First-page largest-font span — the title is usually the biggest text
+           on the first page, located in the top half.
+        """
+        # 1. Try PDF metadata
+        metadata = self.document.metadata
+        if metadata.get("title", "").strip():
+            return metadata["title"].strip()
+
+        # 2. Scan first-page spans; pick the largest font in the top 60% of the page
+        first_page = self.document[0]
+        page_height = first_page.rect.height
+        cutoff_y = page_height * 0.6
+
+        candidates: List[Tuple[float, str]] = []  # (font_size, text)
+        page_dict = first_page.get_text("dict")
+        for block in page_dict.get("blocks", []):
+            if "lines" not in block:
+                continue
+            block_y = block["bbox"][1]
+            if block_y > cutoff_y:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    text = span["text"].strip()
+                    size = span["size"]
+                    if 15 <= len(text) <= 300 and size > 0:
+                        candidates.append((size, text))
+
+        if not candidates:
+            return ""
+
+        # Group spans by font size; merge adjacent spans at the same (largest) size
+        max_size = max(s for s, _ in candidates)
+        title_spans = [t for s, t in candidates if abs(s - max_size) < 0.5]
+        return " ".join(title_spans).strip()
+
+    # ============================================================================
     # Section Detection
     # ============================================================================
 
@@ -121,10 +166,9 @@ class ReferenceExtractor:
         # return the most two frequent x-positions as column starts
         return [sorted_groups[0][0], sorted_groups[1][0]]
 
-    def _detect_sections(self) -> Dict[str, tuple]:
+    def _detect_sections(self) -> List[Dict]:
         """Detect document sections by looping over pages and analyzing text blocks."""
         section_headers = []
-        char_pos = 0
 
         # First pass: detect column starting positions
         column_starts = self._detect_column_starts()
@@ -133,34 +177,107 @@ class ReferenceExtractor:
         for page_num, page in enumerate(self.document):
             blocks = page.get_text("blocks")
             for block in blocks:
-                # Block tuple: (x0, y0, x1, y1, text, ...)
-                # bbox is first 4 elements, text content is index 4
                 if len(block) >= 5:
                     x0, y0, x1, y1, text = block[:5]
                     text = text.replace("\n", " ").strip()
 
-                    # Skip empty blocks
                     if not text:
                         continue
 
-                    # Check if block looks like a section header
-                    if 5 < len(text) < 100:  # quick heuristic to skip very short or very long blocks
-                        # Check for numbered sections (1 Title, 2. Title, etc.)
+                    if 5 < len(text) < 100:
                         if self._is_likely_section_header(text, x0, column_starts):
                             section_num = self._extract_section_number(text)
                             clean_title = self._strip_section_number(text)
-                            section_headers.append({"title": clean_title, "position": char_pos, "number": section_num, "page": page_num, "bbox": (x0, y0, x1, y1)})
-                        # Check for unnumbered Abstract section
+                            section_headers.append({
+                                "title": clean_title,
+                                "text": text,  # original block text (with number) for locating in full_text
+                                "number": section_num,
+                                "page": page_num,
+                                "bbox": (x0, y0, x1, y1),
+                            })
                         elif self._is_abstract_section(text):
-                            section_headers.append({"title": text, "position": char_pos, "number": None, "is_abstract": True, "page": page_num, "bbox": (x0, y0, x1, y1)})
-                        # Check for unnumbered References/Bibliography
+                            section_headers.append({
+                                "title": "Abstract",
+                                "text": text,
+                                "number": None,
+                                "is_abstract": True,
+                                "page": page_num,
+                                "bbox": (x0, y0, x1, y1),
+                            })
                         elif self._is_references_section(text):
-                            section_headers.append({"title": text, "position": char_pos, "number": None, "is_references": True, "page": page_num, "bbox": (x0, y0, x1, y1)})
-
-                    # Update position counter
-                    char_pos += len(text) + 1
+                            section_headers.append({
+                                "title": "References",
+                                "text": text,
+                                "number": None,
+                                "is_references": True,
+                                "page": page_num,
+                                "bbox": (x0, y0, x1, y1),
+                            })
 
         return section_headers
+
+    def _build_section_text_map(self) -> Dict[str, Tuple[int, Optional[int]]]:
+        """Build mapping from section title -> (start, end) char positions in full_text."""
+        sections_with_pos = []
+
+        for section in self.sections:
+            # Search using original block text first (e.g., "1 Introduction")
+            search_text = section.get("text", section["title"])
+            pos = self.full_text.find(search_text)
+
+            # Fallback: search for clean title alone
+            if pos == -1:
+                pos = self.full_text.find(section["title"])
+
+            if pos != -1:
+                sections_with_pos.append((section["title"], pos))
+
+        # Sort by position, deduplicate (keep first occurrence of each title)
+        sections_with_pos.sort(key=lambda x: x[1])
+        seen: set = set()
+        unique: List[Tuple[str, int]] = []
+        for title, pos in sections_with_pos:
+            if title not in seen:
+                seen.add(title)
+                unique.append((title, pos))
+
+        # Map each section to its (start, end) span in full_text
+        result: Dict[str, Tuple[int, Optional[int]]] = {}
+        for i, (title, start) in enumerate(unique):
+            end = unique[i + 1][1] if i + 1 < len(unique) else None
+            result[title] = (start, end)
+
+        return result
+
+    def get_section_text(self, section_name: str) -> str:
+        """Return the body text of the named section (header line excluded)."""
+        # Case-insensitive lookup
+        matched_key = None
+        if section_name in self.section_map:
+            matched_key = section_name
+        else:
+            for key in self.section_map:
+                if key.lower() == section_name.lower():
+                    matched_key = key
+                    break
+
+        if matched_key is None:
+            return ""
+
+        start, end = self.section_map[matched_key]
+        text = self.full_text[start:end] if end is not None else self.full_text[start:]
+
+        # Drop the first line (the section header itself)
+        lines = text.split("\n")
+        return "\n".join(lines[1:]).strip()
+
+    def get_abstract(self) -> str:
+        """Extract the abstract text."""
+        return self.get_section_text("Abstract")
+
+    def get_introduction(self) -> str:
+        """Extract the introduction text."""
+        return self.get_section_text("Introduction")
 
     def _strip_section_number(self, text: str) -> str:
         """Remove leading number and optional period from section title.
@@ -405,22 +522,39 @@ class ReferenceExtractor:
     # ============================================================================
 
     def extract(self) -> List[Dict]:
-        """Extract and parse all references from the PDF document."""
+        """Extract, parse, and rank all references from the PDF document.
+
+        Returns references sorted by importance_score (descending) so the most
+        relevant papers appear first.
+        """
         ref_section = self._find_references_section()
         if not ref_section:
             raise ValueError("No references section detected.")
 
         raw_refs = self._split_references(ref_section)
         parsed_refs = [self._parse_reference(ref) for ref in raw_refs]
-
-        # Enrich with citation location data
         enriched_refs = self._enrich_with_citation_locations(parsed_refs)
-        return enriched_refs
+
+        return sorted(enriched_refs, key=lambda r: r.get("importance_score", 0), reverse=True)
+
+    def _refs_start_position(self) -> int:
+        """Return the character position in full_text where the references section begins."""
+        # Prefer the section_map entry for References
+        if "References" in self.section_map:
+            return self.section_map["References"][0]
+
+        # Fallback: regex search (same patterns as _find_references_section)
+        for pattern in (r"\nReferences\n", r"\nREFERENCES\n", r"\nBibliography\n"):
+            m = re.search(pattern, self.full_text)
+            if m:
+                return m.start()
+
+        return len(self.full_text)
 
     def _enrich_with_citation_locations(self, references: List[Dict]) -> List[Dict]:
         """Add citation location and importance scoring to references."""
-        # Find where each reference is cited in the document
-        text_before_refs = self.full_text[: self.full_text.find(self._find_references_section())]
+        refs_pos = self._refs_start_position()
+        text_before_refs = self.full_text[:refs_pos]
 
         for ref in references:
             tag = ref.get("tag")
@@ -429,30 +563,20 @@ class ReferenceExtractor:
                 ref["importance_score"] = 0
                 continue
 
-            # Find sections where this tag appears
             cited_sections = self._find_citation_in_sections(tag, text_before_refs)
             ref["cited_in_sections"] = list(cited_sections.keys())
             ref["section_citations"] = cited_sections
-
-            # Calculate importance score
             ref["importance_score"] = self._calculate_importance_score(cited_sections)
 
         return references
 
     def _find_citation_in_sections(self, tag: str, text: str) -> Dict[str, int]:
-        """Find which sections cite this reference tag."""
-        cited_sections = {}
-
-        # Escape special regex characters
+        """Find which sections cite this reference tag, using section_map."""
+        cited_sections: Dict[str, int] = {}
         tag_pattern = re.escape(tag).replace(r"\ ", r"\s")
 
-        for section_name, (start, end) in self.sections.items():
-            if end is None:
-                section_text = text[start:]
-            else:
-                section_text = text[start:end]
-
-            # Count occurrences in this section
+        for section_name, (start, end) in self.section_map.items():
+            section_text = text[start:end] if end is not None else text[start:]
             count = len(re.findall(tag_pattern, section_text, re.IGNORECASE))
             if count > 0:
                 cited_sections[section_name] = count
@@ -500,6 +624,33 @@ class ReferenceExtractor:
 
         # Default: neutral importance
         return 1.2
+
+    # ============================================================================
+    # Top-level Analysis
+    # ============================================================================
+
+    def analyze(self, top_n: int = 10) -> Dict:
+        """Run the full analysis pipeline and return a structured result.
+
+        Returns:
+            {
+                "title":        str,
+                "abstract":     str,
+                "introduction": str,
+                "sections":     [str, ...],          # detected section titles
+                "references":   [...],               # all refs, sorted by importance
+                "top_references": [...],             # top_n most important refs
+            }
+        """
+        references = self.extract()
+        return {
+            "title": self.extract_title(),
+            "abstract": self.get_abstract(),
+            "introduction": self.get_introduction(),
+            "sections": list(self.section_map.keys()),
+            "references": references,
+            "top_references": references[:top_n],
+        }
 
 
 # ============================================================================
@@ -630,27 +781,45 @@ def enrich_references_with_scholar(references: List[Dict], delay: float = 1.0) -
 
 
 def main() -> None:
-    argparser = argparse.ArgumentParser(description="Extract references from a PDF document and save to JSON.")
+    argparser = argparse.ArgumentParser(
+        description="Analyse a research PDF: extract title, abstract, introduction, and ranked references."
+    )
     argparser.add_argument("pdf_path", help="Path to the PDF file to process.")
-    argparser.add_argument("-o", "--output", default="output.json", help="Path to save the extracted references JSON.")
-
+    argparser.add_argument("-o", "--output", default="output.json", help="Path to save the JSON output.")
+    argparser.add_argument("--top", type=int, default=10, help="Number of top references to highlight (default: 10).")
+    argparser.add_argument("--enrich", action="store_true", help="Fetch OpenAlex metadata for each reference (slow).")
+    argparser.add_argument("--debug-text", action="store_true", help="Dump extracted full text to text.txt for debugging.")
     args = argparser.parse_args()
 
-    """Main entry point: extract references and save to JSON."""
     extractor = ReferenceExtractor(args.pdf_path)
-    print(extractor.sections)  # Debug: print detected sections
-    with open("text.txt", "w", encoding="utf-8") as f:
-        f.write(extractor.full_text)
-    # references = extractor.extract()
 
-    # # Optionally enrich with Semantic Scholar metadata
-    # # Uncomment the line below to enable metadata lookup (uses 3s delay per request)
-    # references = enrich_references_with_scholar(references)  # Uses default 3s delay
+    if args.debug_text:
+        with open("text.txt", "w", encoding="utf-8") as f:
+            f.write(extractor.full_text)
+        print("Full text written to text.txt")
 
-    # with open(args.output, "w", encoding="utf-8") as f:
-    # json.dump(references, f, indent=2, ensure_ascii=False)
-    # data = lookup_google_scholar_metadata("A microfacetbased brdf for the accurate and efficient rendering of high-definition specular normal maps", "2020")
-    # print(data)
+    result = extractor.analyze(top_n=args.top)
+
+    if args.enrich:
+        print(f"Enriching {len(result['references'])} references via OpenAlex...")
+        result["references"] = enrich_references_with_scholar(result["references"])
+        result["top_references"] = result["references"][: args.top]
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    # Print a summary to stdout
+    print(f"\nTitle:    {result['title']}")
+    print(f"Sections: {', '.join(result['sections'])}")
+    print(f"\nAbstract ({len(result['abstract'])} chars):\n{result['abstract'][:300]}...")
+    print(f"\nTop {args.top} most-cited references:")
+    for i, ref in enumerate(result["top_references"], 1):
+        score = ref.get("importance_score", 0)
+        title = ref.get("title", "(unknown title)")
+        year = ref.get("year", "")
+        print(f"  {i:2}. [{score:5.1f}] {title[:80]} ({year})")
+
+    print(f"\nFull output saved to {args.output}")
 
 
 if __name__ == "__main__":
