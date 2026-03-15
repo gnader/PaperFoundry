@@ -1,0 +1,16 @@
+{
+  "topics": [
+    {
+      "name": "Neural Materials",
+      "keywords": ["neural material", "BRDF", "reflectance", "appearance model", "material appearance", "neural appearance"],
+      "description": "",
+      "papers": []
+    },
+    {
+      "name": "3D Gaussian Splatting",
+      "keywords": ["gaussian splatting", "3DGS", "gaussian splat", "radiance field", "NeRF", "neural radiance"],
+      "description": "",
+      "papers": []
+    }
+  ]
+}

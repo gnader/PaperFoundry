@@ -15,12 +15,26 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 try:
     import requests
 except ImportError:
     raise SystemExit("requests is required: pip install requests")
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+
+def _parse_date_arg(value: str) -> str:
+    """Convert YYYY-MM-DD to YYYYMMDD for arXiv query syntax."""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid date '{value}': expected YYYY-MM-DD")
+    return value.replace("-", "")
 
 
 # ============================================================================
@@ -65,21 +79,26 @@ class ArxivFetcher:
     # Public
     # ------------------------------------------------------------------
 
-    def fetch(self, source: str) -> List[Paper]:
+    def fetch(self, source: str, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Paper]:
         """Fetch papers from a category name or an arXiv listing URL.
 
         Args:
             source: Either a category like "cs.GR" or a full listing URL like
                     "https://arxiv.org/list/cs.GR/recent".
+            date_from: Start date in YYYYMMDD format (inclusive), or None.
+            date_to: End date in YYYYMMDD format (inclusive), or None.
 
         Returns:
             List of Paper objects, most recent first.
         """
         category = self._resolve_category(source)
-        print(f"Fetching arxiv:{category} (up to {self.max_results} papers)...")
+        date_info = ""
+        if date_from or date_to:
+            date_info = f" [{date_from or '...'} → {date_to or 'now'}]"
+        print(f"Fetching arxiv:{category}{date_info} (up to {self.max_results} papers)...")
 
         params = {
-            "search_query": f"cat:{category}",
+            "search_query": self._build_query(category, date_from, date_to),
             "sortBy": "submittedDate",
             "sortOrder": "descending",
             "max_results": self.max_results,
@@ -95,6 +114,15 @@ class ArxivFetcher:
     # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
+
+    def _build_query(self, category: str, date_from: Optional[str], date_to: Optional[str]) -> str:
+        """Build an arXiv search query string with optional date range."""
+        query = f"cat:{category}"
+        if date_from or date_to:
+            lo = date_from or "00000101"
+            hi = date_to or datetime.now(timezone.utc).strftime("%Y%m%d")
+            query += f" AND submittedDate:[{lo} TO {hi}]"
+        return query
 
     def _resolve_category(self, source: str) -> str:
         """Extract a category string from either a bare name or a listing URL."""
@@ -161,14 +189,14 @@ class LiteratureMonitor:
     def __init__(self, max_results: int = 50):
         self.arxiv = ArxivFetcher(max_results=max_results)
 
-    def fetch_all(self, sources: List[str]) -> List[Paper]:
+    def fetch_all(self, sources: List[str], date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Paper]:
         """Fetch from all sources and return a deduplicated, date-sorted list."""
         all_papers: List[Paper] = []
         seen_ids: set = set()
 
         for source in sources:
             try:
-                papers = self._fetch_source(source)
+                papers = self._fetch_source(source, date_from, date_to)
                 for paper in papers:
                     if paper.id not in seen_ids:
                         seen_ids.add(paper.id)
@@ -180,11 +208,11 @@ class LiteratureMonitor:
         all_papers.sort(key=lambda p: p.published, reverse=True)
         return all_papers
 
-    def _fetch_source(self, source: str) -> List[Paper]:
+    def _fetch_source(self, source: str, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Paper]:
         """Route a source string to the right fetcher."""
         # Currently only arXiv is supported; extend here for other sites
         if "arxiv.org" in source or re.match(r"^[a-z]+\.[A-Z]+$", source):
-            return self.arxiv.fetch(source)
+            return self.arxiv.fetch(source, date_from=date_from, date_to=date_to)
         raise ValueError(f"Unsupported source: '{source}'. Only arXiv URLs/categories are supported.")
 
     @staticmethod
@@ -239,10 +267,24 @@ Examples:
         default=50,
         help="Max papers to fetch per source (default: 50).",
     )
+    parser.add_argument(
+        "--from",
+        dest="date_from",
+        metavar="DATE",
+        type=_parse_date_arg,
+        help="Only fetch papers submitted on or after this date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--to",
+        dest="date_to",
+        metavar="DATE",
+        type=_parse_date_arg,
+        help="Only fetch papers submitted on or before this date (YYYY-MM-DD).",
+    )
     args = parser.parse_args()
 
     monitor = LiteratureMonitor(max_results=args.max)
-    papers = monitor.fetch_all(args.sources)
+    papers = monitor.fetch_all(args.sources, date_from=args.date_from, date_to=args.date_to)
 
     # Print a quick summary
     print(f"\n{'─' * 60}")
