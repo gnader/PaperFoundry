@@ -110,6 +110,40 @@ def delete_topic(name: str):
     return jsonify({"ok": True})
 
 
+@app.route("/api/topics/<path:name>/papers", methods=["POST"])
+def add_paper_to_topic(name: str):
+    body = request.get_json(force=True)
+    paper_id = (body.get("paper_id") or "").strip()
+    if not paper_id:
+        return jsonify({"error": "paper_id is required"}), 400
+
+    data = _read_topics_json()
+    topic = next((t for t in data["topics"] if t.get("name") == name), None)
+    if not topic:
+        return jsonify({"error": f"Topic '{name}' not found"}), 404
+
+    papers = topic.setdefault("papers", [])
+    if paper_id not in papers:
+        papers.append(paper_id)
+        _write_topics_json(data)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/topics/<path:name>/papers/<path:paper_id>", methods=["DELETE"])
+def remove_paper_from_topic(name: str, paper_id: str):
+    data = _read_topics_json()
+    topic = next((t for t in data["topics"] if t.get("name") == name), None)
+    if not topic:
+        return jsonify({"error": f"Topic '{name}' not found"}), 404
+
+    papers = topic.get("papers", [])
+    if paper_id not in papers:
+        return jsonify({"error": "Paper not in topic"}), 404
+    topic["papers"] = [p for p in papers if p != paper_id]
+    _write_topics_json(data)
+    return jsonify({"ok": True})
+
+
 # ============================================================================
 # Routes — Fetch API
 # ============================================================================
