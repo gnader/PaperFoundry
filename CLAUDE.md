@@ -25,6 +25,21 @@ python monitor.py cs.GR --from 2026-01-01 --to 2026-03-15 -o papers.json
 python filter.py papers.json --topics topics.json -o filtered.json
 python filter.py papers.json  # uses topics.json in cwd by default
 
+# Analyze a PDF (text extraction, sections, keywords)
+python analyze.py paper.pdf -o output.json
+python analyze.py paper.pdf --debug-text
+
+# Check if a specific paper is cited
+python analyze.py paper.pdf --check-cite "Paper Title" --check-author "Smith"
+
+# Check multiple papers from a JSON list
+python analyze.py paper.pdf --check-cited papers.json
+
+# Extract all references with importance scores
+python analyze.py paper.pdf --refs
+python analyze.py paper.pdf --refs --top 10
+python analyze.py paper.pdf --refs -o refs.json
+
 # Start the local web UI
 python app.py  # opens at http://localhost:5000
 ```
@@ -32,14 +47,14 @@ python app.py  # opens at http://localhost:5000
 ## Dependencies
 
 ```bash
-pip install pymupdf requests flask
+pip install pymupdf requests flask keybert marker-pdf pypdf
 ```
 
-`requests` is optional for `bibextract.py` (skips OpenAlex enrichment if absent) but required for `monitor.py`. `flask` is required for `app.py`.
+`requests` is optional for `bibextract.py` (skips OpenAlex enrichment if absent) but required for `monitor.py`. `flask` is required for `app.py`. `keybert` is required for `analyze.py` keyword extraction. `marker-pdf` is required for `analyze.py` (ML-based PDF→Markdown; pulls in PyTorch as a dependency). `pypdf` is used for PDF metadata extraction in `analyze.py`. `pymupdf` is still required for `bibextract.py`.
 
 ## Architecture
 
-Two independent single-file modules, no shared code:
+Independent single-file modules, no shared code:
 
 ### `bibextract.py` — PDF analysis
 
@@ -67,6 +82,22 @@ Module-level helpers outside the class handle OpenAlex enrichment (`lookup_googl
 - Keyword matching: substring search in `title + abstract` (case-insensitive)
 - Papers matching zero topics are excluded; papers can appear under multiple topics
 - Config: `topics.json` in project root (forward-compatible schema with `description` + `papers` for future Claude AI scoring)
+
+### `analyze.py` — PDF text extraction, sections, keywords, citation checking
+
+Uses `marker-pdf` (ML-based PDF→Markdown converter) for layout-aware text extraction — handles multi-column, tables, equations, headers/footers automatically. Uses `pypdf` for metadata extraction.
+
+`PaperAnalyzer` class:
+- **`__init__`**: runs marker-pdf conversion, strips markdown to plain text, detects sections, builds `section_map`. Accepts optional `model_dict` to share pre-loaded marker models across calls.
+- **`section_map`**: `Dict[str, Tuple[int, Optional[int]]]` — maps section title → (start, end) char positions in `full_text`
+- **`extract_title()`** → pypdf metadata first, then first markdown heading
+- **`extract_keywords(top_n)`** → KeyBERT keyword extraction from introduction/abstract
+- **`is_cited(papers)`** → checks if papers are cited: finds each paper in references, extracts citation key (bracket `[1]`/`[WAF23]` or author name), then searches all sections for that key
+- **`extract_references(top_n)`** → extracts all references as structured data (tag, authors, title, year), enriches with citation locations and importance scores (section-weighted), sorted by importance descending
+- **`summary()`** → title + keywords + sections overview
+- **`close()`** → no-op for backward compat
+
+Module-level `get_model_dict()` caches marker models for reuse across multiple PDFs.
 
 ### `app.py` — local web UI
 

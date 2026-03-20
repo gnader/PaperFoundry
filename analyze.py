@@ -2,78 +2,87 @@
 PDF text extraction and section detection.
 
 Extracts full text, detects sections, and provides structured access to paper content.
+Uses marker-pdf (ML-based PDF→Markdown) for layout-aware text extraction.
 First stage of the analysis pipeline — later stages add keyword extraction and citation checking.
 """
 
 import argparse
-import fitz  # PyMuPDF
 import json
 import re
 from keybert import KeyBERT
+from marker.converters.pdf import PdfConverter
+from marker.models import create_model_dict
+from pypdf import PdfReader
 from typing import Dict, List, Optional, Tuple
+
+
+# ============================================================================
+# Model caching — marker models are expensive to load
+# ============================================================================
+
+_cached_model_dict = None
+
+
+def get_model_dict():
+    """Return cached marker model dict, loading on first call."""
+    global _cached_model_dict
+    if _cached_model_dict is None:
+        _cached_model_dict = create_model_dict()
+    return _cached_model_dict
 
 
 class PaperAnalyzer:
     """Extracts text and detects sections from a PDF document."""
 
-    def __init__(self, pdf_path: str):
+    def __init__(self, pdf_path: str, model_dict=None):
         self.pdf_path = pdf_path
-        self.document = fitz.open(pdf_path)
-        self.full_text = self._extract_text()
+
+        # Run marker-pdf conversion
+        if model_dict is None:
+            model_dict = get_model_dict()
+        converter = PdfConverter(artifact_dict=model_dict)
+        rendered = converter(pdf_path)
+        self.markdown = rendered.markdown
+        self._metadata = rendered.metadata
+
+        # Derive plain text and sections
+        self.full_text = self._strip_markdown(self.markdown)
         self.sections = self._detect_sections()
         self.section_map = self._build_section_text_map()
 
+    def close(self):
+        """No-op for backward compatibility with callers that close the document."""
+        pass
+
     # ========================================================================
-    # Text Extraction
+    # Markdown → Plain Text
     # ========================================================================
 
-    def _extract_text(self) -> str:
-        """Extract text from PDF, handling single and multi-column layouts."""
-        full_text = ""
-
-        for page in self.document:
-            full_text += self._extract_page_text(page) + "\n"
-
-        # Remove hyphenation artifacts from column/justification line breaks
-        full_text = re.sub(r"-\n", "", full_text)
-
-        return full_text
-
-    def _extract_page_text(self, page) -> str:
-        """Extract text from a single page, respecting column layout."""
-        blocks = page.get_text("blocks")
-        blocks = [b for b in blocks if b[4].strip()]  # keep text only
-
-        page_width = page.rect.width
-        x_positions = [b[0] for b in blocks]
-        spread = max(x_positions) - min(x_positions)
-
-        # Single-column layout
-        if spread < page_width * 0.4:
-            blocks.sort(key=lambda b: b[1])
-            return "".join(b[4] for b in blocks)
-
-        # Multi-column layout
-        return self._extract_multicolumn_text(page_width, blocks)
-
-    def _extract_multicolumn_text(self, page_width: float, blocks: List) -> str:
-        """Extract text from multi-column layout."""
-        mid_x = page_width / 2
-        left_blocks, right_blocks = [], []
-
-        for b in blocks:
-            x0, y0, _, _, text = b[:5]
-            if x0 < mid_x:
-                left_blocks.append((y0, text))
-            else:
-                right_blocks.append((y0, text))
-
-        left_blocks.sort(key=lambda x: x[0])
-        right_blocks.sort(key=lambda x: x[0])
-
-        column_text = "\n".join(text for _, text in left_blocks)
-        column_text += "\n" + "\n".join(text for _, text in right_blocks)
-        return column_text
+    def _strip_markdown(self, md: str) -> str:
+        """Convert marker markdown to plain text."""
+        text = md
+        # Remove HTML tags (marker-pdf sometimes emits <span>, <sup>, <sub>, etc.)
+        text = re.sub(r'<[^>]+>', '', text)
+        # Remove image references ![alt](path)
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+        # Convert links [text](url) → text
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        # Remove heading prefixes (keep heading text)
+        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+        # Remove bold/italic markers (skip backslash-escaped markers like \*)
+        text = re.sub(r"(?<!\\)\*{1,3}([^*\n]+?)(?<!\\)\*{1,3}", r"\1", text)
+        text = re.sub(r"(?<!\\)_{1,3}([^_\n]+?)(?<!\\)_{1,3}", r"\1", text)
+        # Unescape markdown backslash escapes (\* → *, \_ → _, etc.)
+        text = re.sub(r'\\([*_\\~`#\[\](){}+\-.!|])', r'\1', text)
+        # Strip inline LaTeX delimiters
+        text = re.sub(r"\$([^$]+)\$", r"\1", text)
+        # Strip display LaTeX delimiters
+        text = re.sub(r"\$\$([^$]+)\$\$", r"\1", text)
+        # Remove horizontal rules
+        text = re.sub(r"^[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+        # Collapse runs of 3+ newlines into 2
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     # ========================================================================
     # Title Extraction
@@ -83,170 +92,143 @@ class PaperAnalyzer:
         """Extract the paper title from the PDF.
 
         Strategy:
-        1. PDF metadata (fast, works when the PDF was exported with metadata).
-        2. First-page largest-font span — the title is usually the biggest text
-           on the first page, located in the top half.
+        1. pypdf metadata (fast, works when the PDF was exported with metadata).
+        2. First heading from marker markdown output.
         """
-        # 1. Try PDF metadata
-        metadata = self.document.metadata
-        if metadata.get("title", "").strip():
-            return metadata["title"].strip()
+        # 1. Try pypdf metadata
+        try:
+            reader = PdfReader(self.pdf_path)
+            meta_title = reader.metadata.title if reader.metadata else None
+            if meta_title and meta_title.strip():
+                return meta_title.strip()
+        except Exception:
+            pass
 
-        # 2. Scan first-page spans; pick the largest font in the top 60% of the page
-        first_page = self.document[0]
-        page_height = first_page.rect.height
-        cutoff_y = page_height * 0.6
+        # 2. First heading from markdown
+        match = re.search(r"^#{1,2}\s+(.+)$", self.markdown, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
 
-        candidates: List[Tuple[float, str]] = []  # (font_size, text)
-        page_dict = first_page.get_text("dict")
-        for block in page_dict.get("blocks", []):
-            if "lines" not in block:
-                continue
-            block_y = block["bbox"][1]
-            if block_y > cutoff_y:
-                continue
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    text = span["text"].strip()
-                    size = span["size"]
-                    if 15 <= len(text) <= 300 and size > 0:
-                        candidates.append((size, text))
-
-        if not candidates:
-            return ""
-
-        # Group spans by font size; merge adjacent spans at the same (largest) size
-        max_size = max(s for s, _ in candidates)
-        title_spans = [t for s, t in candidates if abs(s - max_size) < 0.5]
-        return " ".join(title_spans).strip()
+        return ""
 
     # ========================================================================
     # Section Detection
     # ========================================================================
 
-    def _detect_column_starts(self) -> List[float]:
-        """Detect the starting x-coordinates of columns in the document."""
-        x_positions = []
-        for page in self.document:
-            blocks = page.get_text("blocks")
-            for block in blocks:
-                if len(block) >= 5 and block[4].strip():
-                    x_positions.append((block[0], block[2]))  # x0 (start) and x1 (end)
+    _NON_SECTION_RE = re.compile(
+        r"^(Fig(ure|\.)?|Table|Algorithm|Listing|Appendix)\s+\d",
+        re.IGNORECASE,
+    )
 
-        if not x_positions:
-            return []
-
-        # Group nearby x-positions together (tolerance for rounding/slight variations)
-        tolerance = 5  # Points tolerance for grouping
-        grouped = {}
-        for x, _ in x_positions:
-            # Find if this x belongs to an existing group
-            found_group = False
-            for group_key in grouped.keys():
-                if abs(x - group_key) < tolerance:
-                    grouped[group_key] += 1
-                    found_group = True
-                    break
-            if not found_group:
-                grouped[x] = 1
-
-        # Sort groups by frequency (most common first)
-        sorted_groups = sorted(grouped.items(), key=lambda item: item[1], reverse=True)
-        sorted_groups = [(x, freq / len(x_positions)) for x, freq in sorted_groups if freq / len(x_positions) > 0.1]
-
-        if len(sorted_groups) == 1:
-            return [sorted_groups[0][0]]
-
-        # return the most two frequent x-positions as column starts
-        return [sorted_groups[0][0], sorted_groups[1][0]]
+    def _is_real_section(self, title: str) -> bool:
+        """Check if a heading is a real document section (not a caption or title)."""
+        stripped = title.strip()
+        if not stripped:
+            return False
+        # Reject figure/table/algorithm captions
+        if self._NON_SECTION_RE.match(stripped):
+            return False
+        # Accept numbered sections: "1 Introduction", "2. Methods"
+        if re.match(r"^\d+\.?\s+[A-Z]", stripped):
+            return True
+        # Accept known unnumbered sections
+        lower = self._strip_section_number(stripped).lower()
+        if lower in ("abstract", "introduction", "conclusion", "conclusions",
+                      "discussion", "acknowledgements", "acknowledgments",
+                      "references", "bibliography", "works cited",
+                      "related work", "background", "methods", "methodology",
+                      "results", "evaluation", "experiments", "overview",
+                      "limitations", "future work", "supplementary material"):
+            return True
+        if lower.startswith("appendix"):
+            return True
+        return False
 
     def _detect_sections(self) -> List[Dict]:
-        """Detect document sections. Tries PDF bookmarks first, falls back to text heuristics."""
-        # Strategy 1: PDF bookmarks (table of contents) — most reliable
-        toc = self.document.get_toc()
-        if toc:
-            return self._sections_from_bookmarks(toc)
+        """Detect document sections from marker metadata or markdown headings.
 
-        # Strategy 2: text-based heuristic detection
-        return self._sections_from_text()
-
-    def _sections_from_bookmarks(self, toc: List) -> List[Dict]:
-        """Build section list from PDF bookmarks (get_toc() output).
-
-        Each toc entry is [level, title, page_number].
-        We only keep top-level sections (level 1).
+        Only keeps top-level numbered sections and known unnumbered sections
+        (Abstract, References, etc.). Skips the paper title, subsections,
+        and non-section headings (Algorithm, Figure, Table captions).
         """
-        section_headers = []
-        for level, title, page in toc:
-            if level != 1:
+        sections = []
+
+        # Strategy 1: marker's table_of_contents metadata
+        toc = self._metadata.get("table_of_contents") if isinstance(self._metadata, dict) else None
+        if toc and isinstance(toc, list) and len(toc) > 0:
+            # Find the most common heading level among numbered sections
+            # to determine which level represents top-level sections
+            levels_of_numbered = []
+            for entry in toc:
+                title = entry.get("title", "").strip()
+                level = entry.get("heading_level") or entry.get("level") or 1
+                if re.match(r"^\d+\.?\s+[A-Z]", title):
+                    levels_of_numbered.append(level)
+            section_level = min(levels_of_numbered) if levels_of_numbered else 1
+
+            for entry in toc:
+                level = entry.get("heading_level") or entry.get("level") or 1
+                title = entry.get("title", "").strip()
+                if not title:
+                    continue
+                # Skip deeper headings (subsections)
+                if level > section_level and not self._is_references_section(self._strip_section_number(title)) and not self._is_abstract_section(self._strip_section_number(title)):
+                    continue
+                if not self._is_real_section(title):
+                    continue
+                section_num = self._extract_section_number(title)
+                clean_title = self._strip_section_number(title)
+                is_refs = self._is_references_section(clean_title)
+                is_abs = self._is_abstract_section(clean_title)
+                sect = {
+                    "title": clean_title,
+                    "text": title,
+                    "number": section_num,
+                    "page": entry.get("page_id", entry.get("page", 0)),
+                }
+                if is_refs:
+                    sect["is_references"] = True
+                if is_abs:
+                    sect["is_abstract"] = True
+                sections.append(sect)
+            if sections:
+                return sections
+
+        # Strategy 2: regex on markdown headings
+        # First pass: find the heading level used for numbered sections
+        heading_levels = []
+        for match in re.finditer(r"^(#{1,6})\s+(.+)$", self.markdown, re.MULTILINE):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            if re.match(r"^\d+\.?\s+[A-Z]", title):
+                heading_levels.append(level)
+        section_level = min(heading_levels) if heading_levels else 2
+
+        for match in re.finditer(r"^(#{1,6})\s+(.+)$", self.markdown, re.MULTILINE):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            # Skip deeper headings (subsections)
+            if level > section_level and not self._is_references_section(self._strip_section_number(title)) and not self._is_abstract_section(self._strip_section_number(title)):
                 continue
-            title = title.strip()
+            if not self._is_real_section(title):
+                continue
             section_num = self._extract_section_number(title)
             clean_title = self._strip_section_number(title)
             is_refs = self._is_references_section(clean_title)
             is_abs = self._is_abstract_section(clean_title)
-            entry = {
+            sect = {
                 "title": clean_title,
-                "text": title,  # original text for locating in full_text
+                "text": title,
                 "number": section_num,
-                "page": page - 1,  # bookmarks use 1-based pages
+                "page": 0,
             }
             if is_refs:
-                entry["is_references"] = True
+                sect["is_references"] = True
             if is_abs:
-                entry["is_abstract"] = True
-            section_headers.append(entry)
-        return section_headers
+                sect["is_abstract"] = True
+            sections.append(sect)
 
-    def _sections_from_text(self) -> List[Dict]:
-        """Detect sections by analyzing text blocks (fallback when no bookmarks)."""
-        section_headers = []
-
-        # First pass: detect column starting positions
-        column_starts = self._detect_column_starts()
-
-        # Second pass: identify section headers based on text content and position
-        for page_num, page in enumerate(self.document):
-            blocks = page.get_text("blocks")
-            for block in blocks:
-                if len(block) >= 5:
-                    x0, y0, x1, y1, text = block[:5]
-                    text = text.replace("\n", " ").strip()
-
-                    if not text:
-                        continue
-
-                    if 5 < len(text) < 100:
-                        if self._is_likely_section_header(text, x0, column_starts):
-                            section_num = self._extract_section_number(text)
-                            clean_title = self._strip_section_number(text)
-                            section_headers.append({
-                                "title": clean_title,
-                                "text": text,  # original block text (with number) for locating in full_text
-                                "number": section_num,
-                                "page": page_num,
-                                "bbox": (x0, y0, x1, y1),
-                            })
-                        elif self._is_abstract_section(text):
-                            section_headers.append({
-                                "title": "Abstract",
-                                "text": text,
-                                "number": None,
-                                "is_abstract": True,
-                                "page": page_num,
-                                "bbox": (x0, y0, x1, y1),
-                            })
-                        elif self._is_references_section(text):
-                            section_headers.append({
-                                "title": "References",
-                                "text": text,
-                                "number": None,
-                                "is_references": True,
-                                "page": page_num,
-                                "bbox": (x0, y0, x1, y1),
-                            })
-
-        return section_headers
+        return sections
 
     def _build_section_text_map(self) -> Dict[str, Tuple[int, Optional[int]]]:
         """Build mapping from section title -> (start, end) char positions in full_text."""
@@ -314,38 +296,6 @@ class PaperAnalyzer:
     def _strip_section_number(self, text: str) -> str:
         """Remove leading number and optional period from section title."""
         return re.sub(r"^\d+\.?\s+", "", text).strip()
-
-    def _is_likely_section_header(self, text: str, x0: float = None, column_starts: List[float] = None) -> bool:
-        """Check if text looks like a section header.
-
-        Matches: "1 Title", "1. Title", "2 Title"
-        Rejects: "1.1 Subsection", "2 of 33 Author et al..."
-        """
-        # Match: digit(s), optional period, then space + title word (capitalized)
-        # Reject subsections like "1.1" (digit.digit)
-        section_pattern = r"^\d+\.?\s+[A-Z]"
-
-        if not re.match(section_pattern, text):
-            return False
-
-        # Reject page headers like "2 of 33" or "10 of 33"
-        if re.match(r"^\d+\s+of\s+\d+", text):
-            return False
-
-        # Reject subsection numbers like "1.1 Title"
-        if re.match(r"^\d+\.\d+", text):
-            return False
-
-        # Reject pseudocode/algorithm lines (contain ← or other non-prose symbols)
-        if "←" in text or "≤" in text:
-            return False
-
-        if x0 is not None and column_starts:
-            tolerance = 5  # points — section headers may be slightly indented vs body text
-            is_at_column_start = any(abs(x0 - col_start) < tolerance for col_start in column_starts)
-            return is_at_column_start
-
-        return True
 
     def _extract_section_number(self, text: str) -> Optional[int]:
         """Extract the section number from a section header like '1 Title' or '2. Title'."""
@@ -446,6 +396,12 @@ class PaperAnalyzer:
 
     def _split_reference_entries(self, refs_text: str) -> List[str]:
         """Split references section text into individual entries."""
+        # Try splitting on bullet-list markers (marker-pdf often formats refs as "- ")
+        bullet_split = re.split(r'\n(?=- )', refs_text)
+        entries = [e.strip().lstrip('- ').strip() for e in bullet_split if e.strip()]
+        if len(entries) > 1:
+            return entries
+
         # Try splitting on bracket patterns like [1], [2], [WAF23]
         bracket_split = re.split(r'(?=\[\S+?\])', refs_text)
         entries = [e.strip() for e in bracket_split if e.strip()]
@@ -499,13 +455,178 @@ class PaperAnalyzer:
         if match:
             return match.group(1)
 
-        # Author-year style: use author last name as search term
+        # Author-year style: use first author's last name as search term
         if authors:
-            last_name = authors.split()[-1].rstrip(".,") if " " in authors else authors.rstrip(".,")
-            if last_name:
-                return last_name
+            first_author = authors.split(",")[0].strip()
+            if first_author and len(first_author) > 1:
+                return first_author
 
         return None
+
+    # ========================================================================
+    # Reference Extraction
+    # ========================================================================
+
+    def extract_references(self, top_n: int = None) -> List[Dict]:
+        """Extract all references as structured data, scored by citation importance.
+
+        Returns list of dicts: {raw, tag, authors, title, year, sections, importance_score}
+        sorted by importance_score descending.
+        """
+        refs_text = self.get_section_text("References")
+        if not refs_text:
+            return []
+
+        entries = self._split_reference_entries(refs_text)
+        refs = [self._parse_reference(entry) for entry in entries]
+        refs = [r for r in refs if r is not None]
+        refs = self._enrich_with_citations(refs)
+        refs.sort(key=lambda r: r["importance_score"], reverse=True)
+
+        if top_n is not None:
+            refs = refs[:top_n]
+        return refs
+
+    def _parse_reference(self, entry: str) -> Optional[Dict]:
+        """Parse a single reference entry into structured fields."""
+        entry = re.sub(r'\s+', ' ', entry).strip()
+        if not entry:
+            return None
+
+        # Reject entries too short to be a real reference
+        if len(entry) < 20:
+            return None
+
+        # Reject entries that look like equations (high density of LaTeX chars)
+        latex_chars = sum(1 for c in entry if c in r'\{}^_=')
+        if len(entry) > 0 and latex_chars / len(entry) > 0.1:
+            return None
+
+        # Extract bracket tag if present
+        tag = None
+        remainder = entry
+        m = re.match(r'(\[[^\]]+\])', entry)
+        if m:
+            tag = m.group(1)
+            remainder = entry[m.end():].strip().lstrip(".,").strip()
+
+        year = self._extract_year(entry)
+
+        # Reject entries with no year AND no bracket tag (likely not a reference)
+        if year is None and tag is None:
+            return None
+
+        # Parse authors and title from the remainder
+        authors, title = self._parse_author_title(remainder, year)
+
+        # If no bracket tag, try author-name fallback for citation key
+        if tag is None and authors:
+            tag = self._extract_citation_key(entry, authors)
+
+        return {
+            "raw": entry,
+            "tag": tag,
+            "authors": authors,
+            "title": title,
+            "year": year,
+        }
+
+    def _extract_year(self, text: str) -> Optional[str]:
+        """Find a 4-digit year (19xx or 20xx) in text."""
+        # Prefer years in parentheses like (2023) or at end of string
+        m = re.search(r'\(?((?:19|20)\d{2})\)?', text)
+        return m.group(1) if m else None
+
+    def _parse_author_title(self, text: str, year: Optional[str]) -> Tuple[str, str]:
+        """Split reference text into authors and title.
+
+        Heuristic: authors come first, separated from title by a period or
+        a quoted/italic title boundary. The title is typically the first
+        sentence-like segment after the author block.
+        """
+        # Strategy 1: Colon-split (Eurographics style "AUTHOR X.: Title")
+        # Remove year first for cleaner title extraction
+        clean = text
+        if year:
+            clean = re.sub(r'\(?' + re.escape(year) + r'\)?,?\s*', '', clean, count=1)
+        colon_parts = re.split(r':\s+(?=[A-Z])', clean, maxsplit=1)
+        if len(colon_parts) >= 2:
+            authors = colon_parts[0].strip().rstrip(":.")
+            title_rest = colon_parts[1].strip()
+            title_match = re.match(r'["\u201c]?(.+?)["\u201d]?(?:\.|$)', title_rest)
+            title = title_match.group(1).strip(' ""\u201c\u201d') if title_match else title_rest.split(".")[0].strip()
+            return authors, title
+
+        # Strategy 2: Year-delimited (ACM style "AUTHORS. YEAR. Title. Venue.")
+        # Split at the year when it follows a period or comma (not embedded in venue)
+        if year:
+            m = re.search(r'[.,]\s*\(?' + re.escape(year) + r'\)?\.?\s+', text)
+            if m:
+                authors = text[:m.start()].strip().rstrip('.,')
+                title_rest = text[m.end():].strip()
+                if title_rest:
+                    title = title_rest.split(".")[0].strip()
+                    if title and len(title) > 2:
+                        return authors, title
+
+        # Strategy 3: Period-split with word-length guard — only split on ". "
+        # when the next word is ≥3 lowercase chars (avoids splitting on initials)
+        parts = re.split(r'\.\s+(?=[A-Z][a-z]{2,})', clean, maxsplit=1)
+        if len(parts) >= 2:
+            authors = parts[0].strip().rstrip(".")
+            title_rest = parts[1].strip()
+            title_match = re.match(r'["\u201c]?(.+?)["\u201d]?(?:\.|$)', title_rest)
+            title = title_match.group(1).strip(' ""\u201c\u201d') if title_match else title_rest.split(".")[0].strip()
+            return authors, title
+
+        # Fallback: treat everything before first comma-period as authors
+        return clean.split(".")[0].strip(), ""
+
+    def _enrich_with_citations(self, refs: List[Dict]) -> List[Dict]:
+        """Add citation locations and importance scores to each reference."""
+        for ref in refs:
+            tag = ref.get("tag")
+            section_counts: Dict[str, int] = {}
+
+            if tag:
+                for section_title, (start, end) in self.section_map.items():
+                    # Skip references section itself
+                    if self._is_references_section(section_title):
+                        continue
+                    section_text = self.full_text[start:end] if end else self.full_text[start:]
+                    # Bracket tags like [1] or [ZK16]: exact substring match
+                    # Author-name tags like "DONG": case-insensitive word boundary match
+                    if tag.startswith('['):
+                        count = section_text.count(tag)
+                    else:
+                        count = len(re.findall(r'\b' + re.escape(tag) + r'\b', section_text, re.IGNORECASE))
+                    if count > 0:
+                        section_counts[section_title] = count
+
+            ref["sections"] = list(section_counts.keys())
+            ref["citation_counts"] = section_counts
+            ref["importance_score"] = self._calculate_importance(section_counts)
+
+        return refs
+
+    def _get_section_weight(self, title: str) -> float:
+        """Weight sections by typical importance for citation analysis."""
+        lower = title.lower()
+        # Methods/results sections are most important
+        if any(kw in lower for kw in ("method", "approach", "algorithm", "implementation",
+                                       "result", "experiment", "evaluation")):
+            return 3.0
+        if any(kw in lower for kw in ("related work", "background", "previous")):
+            return 2.0
+        if any(kw in lower for kw in ("conclusion", "discussion", "future")):
+            return 1.5
+        # Introduction and other sections
+        return 1.0
+
+    def _calculate_importance(self, section_counts: Dict[str, int]) -> float:
+        """Calculate importance score from section citation counts."""
+        return sum(count * self._get_section_weight(section)
+                   for section, count in section_counts.items())
 
     # ========================================================================
     # Summary
@@ -516,7 +637,7 @@ class PaperAnalyzer:
         return {
             "title": self.extract_title(),
             "keywords": self.extract_keywords(),
-            "sections": [{"title": s["title"], "page": s["page"] + 1} for s in self.sections],
+            "sections": [{"title": s["title"], "page": s.get("page", 0) + 1} for s in self.sections],
             "text_length": len(self.full_text),
         }
 
@@ -526,6 +647,8 @@ def main():
     parser.add_argument("pdf", nargs="+", help="Path(s) to PDF file(s)")
     parser.add_argument("-o", "--output", help="Save structured output to JSON file")
     parser.add_argument("--debug-text", action="store_true", help="Dump full extracted text")
+    parser.add_argument("--refs", action="store_true", help="Extract all references with importance scores")
+    parser.add_argument("--top", type=int, default=None, help="Limit to top N references (used with --refs)")
     parser.add_argument("--check-cite", help="Check if a paper (by title) is cited")
     parser.add_argument("--check-author", help="Author last name (used with --check-cite)")
     parser.add_argument("--check-cited", help="Check multiple papers from a JSON file")
@@ -534,14 +657,39 @@ def main():
     import sys
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+    # Pre-load models once for all PDFs
+    model_dict = get_model_dict()
+
     results = []
     for pdf_path in args.pdf:
-        analyzer = PaperAnalyzer(pdf_path)
+        analyzer = PaperAnalyzer(pdf_path, model_dict=model_dict)
 
         if args.debug_text:
             print(f"=== {pdf_path} ===")
             print(analyzer.full_text)
             print()
+            continue
+
+        # Reference extraction mode
+        if args.refs:
+            refs = analyzer.extract_references(top_n=args.top)
+
+            if not args.output:
+                if len(args.pdf) > 1:
+                    print(f"=== {pdf_path} ===")
+                print(f"Found {len(refs)} references")
+                print()
+                for i, ref in enumerate(refs, 1):
+                    tag_str = ref["tag"] or "?"
+                    authors_str = ref["authors"] or "Unknown"
+                    title_str = f' — "{ref["title"]}"' if ref["title"] else ""
+                    year_str = f' ({ref["year"]})' if ref["year"] else ""
+                    print(f"  {i:>3}. [{ref['importance_score']:>5.1f}] {tag_str:<10} {authors_str}{title_str}{year_str}")
+                    if ref["sections"]:
+                        print(f"       Cited in: {', '.join(ref['sections'])}")
+                print()
+
+            results.append({"file": pdf_path, "references": refs})
             continue
 
         # Citation checking mode

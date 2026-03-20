@@ -9,17 +9,30 @@ Usage:
 """
 
 import json
+import logging
 import os
+import shutil
+import time
 
-from flask import Flask, jsonify, render_template, request
+import requests as http_requests
+from flask import Flask, Response, jsonify, render_template, request
 
+from analyze import PaperAnalyzer
 from filter import Topic, TopicFilter, load_topics
 from monitor import LiteratureMonitor
 
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+
 app = Flask(__name__)
 
-TOPICS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "topics.json")
-LIBRARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "library.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOPICS_PATH = os.path.join(_BASE_DIR, "topics.json")
+LIBRARY_PATH = os.path.join(_BASE_DIR, "library.json")
+TMP_DIR = os.path.join(_BASE_DIR, "tmp")
 
 
 # ============================================================================
@@ -49,6 +62,23 @@ def _read_library() -> dict:
 def _write_library(data: dict) -> None:
     with open(LIBRARY_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _cleanup_tmp(tmp_dir: str) -> None:
+    """Remove a temp directory, retrying on Windows file-lock errors."""
+    if not os.path.exists(tmp_dir):
+        return
+    for attempt in range(5):
+        try:
+            shutil.rmtree(tmp_dir)
+            return
+        except PermissionError:
+            time.sleep(0.3)
+    # Last-ditch attempt — log if cleanup fails so user can inspect ./tmp/
+    try:
+        shutil.rmtree(tmp_dir)
+    except Exception as e:
+        logging.warning("Could not remove %s: %s (clean up manually)", tmp_dir, e)
 
 
 def _to_arxiv_date(value: str) -> str:
@@ -98,6 +128,25 @@ def add_topic():
     return jsonify({"ok": True}), 201
 
 
+@app.route("/api/topics/<path:name>", methods=["PUT"])
+def update_topic(name: str):
+    body = request.get_json(force=True)
+    data = _read_topics_json()
+    topic = next((t for t in data["topics"] if t.get("name") == name), None)
+    if not topic:
+        return jsonify({"error": f"Topic '{name}' not found"}), 404
+
+    if "description" in body:
+        topic["description"] = body["description"]
+    if "keywords" in body:
+        if not isinstance(body["keywords"], list):
+            return jsonify({"error": "keywords must be a list"}), 400
+        topic["keywords"] = body["keywords"]
+
+    _write_topics_json(data)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/topics/<path:name>", methods=["DELETE"])
 def delete_topic(name: str):
     data = _read_topics_json()
@@ -142,6 +191,185 @@ def remove_paper_from_topic(name: str, paper_id: str):
     topic["papers"] = [p for p in papers if p != paper_id]
     _write_topics_json(data)
     return jsonify({"ok": True})
+
+
+@app.route("/api/topics/<path:name>/extract-keywords", methods=["POST"])
+def extract_paper_keywords(name: str):
+    body = request.get_json(force=True)
+    paper_id = (body.get("paper_id") or "").strip()
+    if not paper_id:
+        return jsonify({"error": "paper_id is required"}), 400
+
+    data = _read_topics_json()
+    topic = next((t for t in data["topics"] if t.get("name") == name), None)
+    if not topic:
+        return jsonify({"error": f"Topic '{name}' not found"}), 404
+
+    # Download PDF from arXiv
+    tmp_dir = os.path.join(TMP_DIR, f"extract-{paper_id.replace('/', '_')}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    pdf_path = os.path.join(tmp_dir, f"{paper_id.replace('/', '_')}.pdf")
+    analyzer = None
+    try:
+        url = f"https://arxiv.org/pdf/{paper_id}"
+        resp = http_requests.get(url, timeout=30)
+        resp.raise_for_status()
+        with open(pdf_path, "wb") as f:
+            f.write(resp.content)
+
+        analyzer = PaperAnalyzer(pdf_path)
+        keywords = analyzer.extract_keywords(top_n=20)
+        return jsonify({"keywords": keywords})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if analyzer is not None:
+            try:
+                analyzer.close()
+            except Exception:
+                pass
+        _cleanup_tmp(tmp_dir)
+
+
+# ============================================================================
+# Routes — Analysis API
+# ============================================================================
+
+
+@app.route("/api/analyze-topic", methods=["POST"])
+def analyze_topic():
+    body = request.get_json(force=True)
+    topic_name = body.get("topic_name", "")
+    papers = body.get("papers", [])
+
+    if not topic_name or not papers:
+        return jsonify({"error": "topic_name and papers are required"}), 400
+
+    # Load topic config
+    data = _read_topics_json()
+    topic = next((t for t in data["topics"] if t.get("name") == topic_name), None)
+    if not topic:
+        return jsonify({"error": f"Topic '{topic_name}' not found"}), 404
+
+    topic_keywords = topic.get("keywords", [])
+    associated_paper_ids = topic.get("papers", [])
+
+    # Resolve associated papers from library for citation checking
+    library = _read_library()
+    lib_by_id = {p["id"]: p for p in library.get("papers", [])}
+    associated_papers = []
+    for pid in associated_paper_ids:
+        if pid in lib_by_id:
+            lp = lib_by_id[pid]
+            authors_str = lp["authors"][0] if lp.get("authors") else ""
+            associated_papers.append({"title": lp.get("title", ""), "authors": authors_str})
+
+    total = len(papers)
+
+    def _sse_event(data: dict) -> str:
+        return f"data: {json.dumps(data)}\n\n"
+
+    def generate():
+        tmp_dir = os.path.join(TMP_DIR, f"analyze-{int(time.time())}")
+        os.makedirs(tmp_dir, exist_ok=True)
+        results = []
+
+        try:
+            for i, paper in enumerate(papers):
+                pid = paper.get("id", "")
+                result = {
+                    "id": pid,
+                    "title": paper.get("title", ""),
+                    "relevance_score": 0,
+                    "extracted_keywords": [],
+                    "matched_keywords": [],
+                    "citations": [],
+                    "error": None,
+                }
+
+                if not pid:
+                    result["error"] = "No paper ID"
+                    results.append(result)
+                    yield _sse_event({"type": "error", "paper_id": pid, "message": "No paper ID"})
+                    continue
+
+                pdf_path = os.path.join(tmp_dir, f"{pid.replace('/', '_')}.pdf")
+                analyzer = None
+                try:
+                    # Rate limit: 1s delay between downloads (skip first)
+                    if i > 0:
+                        time.sleep(1)
+
+                    app.logger.info("[%d/%d] Downloading %s", i + 1, total, pid)
+                    yield _sse_event({"type": "progress", "paper_id": pid, "step": "downloading", "index": i + 1, "total": total})
+
+                    url = f"https://arxiv.org/pdf/{pid}"
+                    resp = http_requests.get(url, timeout=30)
+                    resp.raise_for_status()
+                    with open(pdf_path, "wb") as f:
+                        f.write(resp.content)
+
+                    app.logger.info("[%d/%d] Analyzing %s", i + 1, total, pid)
+                    yield _sse_event({"type": "progress", "paper_id": pid, "step": "analyzing", "index": i + 1, "total": total})
+
+                    analyzer = PaperAnalyzer(pdf_path)
+                    extracted_keywords = analyzer.extract_keywords(top_n=20)
+                    result["extracted_keywords"] = extracted_keywords
+
+                    # Citation checking
+                    if associated_papers:
+                        cite_results = analyzer.is_cited(associated_papers)
+                        result["citations"] = cite_results
+
+                    # Relevance scoring
+                    score = 0.0
+                    topic_kws_lower = {k.lower() for k in topic_keywords}
+                    matched = set()
+
+                    for kw, kw_score in extracted_keywords:
+                        kw_lower = kw.lower()
+                        if kw_lower in topic_kws_lower:
+                            score += kw_score
+                            matched.add(kw)
+                        else:
+                            for tkw in topic_kws_lower:
+                                if kw_lower in tkw or tkw in kw_lower:
+                                    score += kw_score * 0.5
+                                    matched.add(kw)
+                                    break
+
+                    # Citation bonus
+                    for cr in result.get("citations", []):
+                        if cr.get("cited"):
+                            score += 2.0
+
+                    result["relevance_score"] = round(score, 2)
+                    result["matched_keywords"] = list(matched)
+
+                    app.logger.info("[%d/%d] Done %s — score: %.1f", i + 1, total, pid, result["relevance_score"])
+                    yield _sse_event({"type": "progress", "paper_id": pid, "step": "done", "index": i + 1, "total": total, "score": result["relevance_score"]})
+
+                except Exception as e:
+                    result["error"] = str(e)
+                    app.logger.error("[%d/%d] Error %s: %s", i + 1, total, pid, e)
+                    yield _sse_event({"type": "error", "paper_id": pid, "message": str(e)})
+                finally:
+                    if analyzer is not None:
+                        try:
+                            analyzer.close()
+                        except Exception:
+                            pass
+
+                results.append(result)
+        finally:
+            _cleanup_tmp(tmp_dir)
+
+        # Sort by relevance score descending
+        results.sort(key=lambda r: r["relevance_score"], reverse=True)
+        app.logger.info("Analysis complete for topic '%s' — %d papers", topic_name, len(results))
+        yield _sse_event({"type": "complete", "papers": results})
+
+    return Response(generate(), mimetype="text/event-stream")
 
 
 # ============================================================================
