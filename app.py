@@ -96,6 +96,16 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/tmp", methods=["DELETE"])
+def clean_tmp():
+    """Remove all files in the tmp directory."""
+    if os.path.exists(TMP_DIR):
+        shutil.rmtree(TMP_DIR, ignore_errors=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
+    app.logger.info("Cleaned tmp directory")
+    return jsonify({"message": "Tmp folder cleaned"})
+
+
 # ============================================================================
 # Routes — Topics API
 # ============================================================================
@@ -236,6 +246,100 @@ def extract_paper_keywords(name: str):
 # ============================================================================
 
 
+@app.route("/api/analyze-paper", methods=["POST"])
+def analyze_paper():
+    """Analyze a single paper: extract keywords, check citations, score relevance."""
+    body = request.get_json(force=True)
+    paper_id = body.get("paper_id", "")
+    topic_name = body.get("topic_name", "")
+
+    if not paper_id:
+        return jsonify({"error": "paper_id is required"}), 400
+
+    # Load topic config for keyword matching + citation checking
+    topic_keywords = []
+    associated_papers = []
+    if topic_name:
+        data = _read_topics_json()
+        topic = next((t for t in data["topics"] if t.get("name") == topic_name), None)
+        if topic:
+            topic_keywords = topic.get("keywords", [])
+            associated_paper_ids = topic.get("papers", [])
+            library = _read_library()
+            lib_by_id = {p["id"]: p for p in library.get("papers", [])}
+            for pid in associated_paper_ids:
+                if pid in lib_by_id:
+                    lp = lib_by_id[pid]
+                    authors_str = lp["authors"][0] if lp.get("authors") else ""
+                    associated_papers.append({"title": lp.get("title", ""), "authors": authors_str})
+
+    tmp_dir = os.path.join(TMP_DIR, f"analyze-{paper_id.replace('/', '_')}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    analyzer = None
+
+    try:
+        pdf_path = os.path.join(tmp_dir, f"{paper_id.replace('/', '_')}.pdf")
+        app.logger.info("Downloading %s", paper_id)
+        url = f"https://arxiv.org/pdf/{paper_id}"
+        resp = http_requests.get(url, timeout=30)
+        resp.raise_for_status()
+        with open(pdf_path, "wb") as f:
+            f.write(resp.content)
+
+        app.logger.info("Analyzing %s", paper_id)
+        analyzer = PaperAnalyzer(pdf_path)
+        extracted_keywords = analyzer.extract_keywords(top_n=20)
+
+        # Extract full reference list
+        references = analyzer.extract_references()
+
+        # Citation checking
+        citations = []
+        if associated_papers:
+            citations = analyzer.is_cited(associated_papers)
+
+        # Relevance scoring
+        score = 0.0
+        matched = set()
+        topic_kws_lower = {k.lower() for k in topic_keywords}
+        for kw, kw_score in extracted_keywords:
+            kw_lower = kw.lower()
+            if kw_lower in topic_kws_lower:
+                score += kw_score
+                matched.add(kw)
+            else:
+                for tkw in topic_kws_lower:
+                    if kw_lower in tkw or tkw in kw_lower:
+                        score += kw_score * 0.5
+                        matched.add(kw)
+                        break
+        for cr in citations:
+            if cr.get("cited"):
+                score += 2.0
+
+        result = {
+            "relevance_score": round(score, 2),
+            "extracted_keywords": extracted_keywords,
+            "matched_keywords": list(matched),
+            "citations": citations,
+            "references": references,
+            "error": None,
+        }
+        app.logger.info("Done %s — score: %.1f", paper_id, score)
+        return jsonify(result)
+
+    except Exception as e:
+        app.logger.error("Error analyzing %s: %s", paper_id, e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if analyzer is not None:
+            try:
+                analyzer.close()
+            except Exception:
+                pass
+        _cleanup_tmp(tmp_dir)
+
+
 @app.route("/api/analyze-topic", methods=["POST"])
 def analyze_topic():
     body = request.get_json(force=True)
@@ -284,6 +388,7 @@ def analyze_topic():
                     "extracted_keywords": [],
                     "matched_keywords": [],
                     "citations": [],
+                    "references": [],
                     "error": None,
                 }
 
@@ -315,6 +420,7 @@ def analyze_topic():
                     analyzer = PaperAnalyzer(pdf_path)
                     extracted_keywords = analyzer.extract_keywords(top_n=20)
                     result["extracted_keywords"] = extracted_keywords
+                    result["references"] = analyzer.extract_references()
 
                     # Citation checking
                     if associated_papers:

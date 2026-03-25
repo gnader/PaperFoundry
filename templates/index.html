@@ -8,83 +8,67 @@
 </head>
 <body>
 
-<header>
+<header class="app-header">
   <span class="logo">PaperFoundry</span>
-  <nav>
-    <button class="active" onclick="switchTab('topics', this)">Topics</button>
-    <button onclick="switchTab('papers', this)">Papers</button>
-    <button onclick="switchTab('library', this)">Library</button>
-  </nav>
+  <input type="text" class="search-bar" placeholder="Search papers, topics, keywords…" disabled>
 </header>
 
-<main>
+<nav class="tab-nav">
+  <button class="tab-btn active" data-tab="discovery">Discovery</button>
+  <button class="tab-btn" data-tab="library">Library</button>
+  <button class="tab-btn" data-tab="topics">Topics</button>
+  <button class="settings-btn" title="Clean tmp folder" onclick="cleanTmp(this)">&#128465;</button>
+  <button class="settings-btn" title="Settings">&#9881;</button>
+</nav>
 
-  <!-- ════════════════════════════════════════ TOPICS TAB ════ -->
-  <div id="tab-topics" class="tab active">
+<main class="page-content">
 
-    <div id="topics-list">
-      <div class="empty">Loading topics…</div>
-    </div>
+  <!-- ════════════════════════════════════════ DISCOVERY TAB ════ -->
+  <div id="tab-discovery" class="tab active">
 
-    <hr class="divider">
-
-    <div id="add-topic-section">
-      <h2>Add Topic</h2>
-      <div class="form-group">
-        <label for="new-topic-name">Name</label>
-        <input type="text" id="new-topic-name" placeholder="e.g. Neural Rendering">
-      </div>
-      <div class="form-group">
-        <label for="new-topic-keywords">Keywords <span style="color:var(--text-dim)">(comma-separated)</span></label>
-        <input type="text" id="new-topic-keywords" placeholder="e.g. neural rendering, radiance field, NeRF">
-      </div>
-      <button class="btn btn-primary" onclick="addTopic()">Add Topic</button>
-      <div id="add-error"></div>
-    </div>
-
-  </div>
-
-  <!-- ════════════════════════════════════════ PAPERS TAB ════ -->
-  <div id="tab-papers" class="tab">
-
-    <div class="card" style="margin-bottom:20px">
-      <h2 style="margin-bottom:14px">Fetch Papers</h2>
-
-      <div class="form-row-3">
-        <div class="form-group" style="margin-bottom:0">
-          <label for="fetch-cats">Categories</label>
-          <input type="text" id="fetch-cats" placeholder="cs.GR cs.CV cs.LG" value="cs.GR cs.CV">
+    <div class="card" style="margin-bottom:16px;padding:10px 16px">
+      <div style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+        <button class="btn btn-primary" id="fetch-btn" onclick="fetchPapers()" style="white-space:nowrap">Fetch &amp; Filter</button>
+        <div style="flex:2;min-width:140px">
+          <label for="fetch-cats" style="margin-bottom:2px">Categories</label>
+          <input type="text" id="fetch-cats" placeholder="cs.GR cs.CV" value="cs.GR cs.CV" style="width:100%">
         </div>
-        <div class="form-group" style="margin-bottom:0">
-          <label for="fetch-from">From</label>
-          <input type="date" id="fetch-from">
+        <div style="min-width:120px">
+          <label for="fetch-from" style="margin-bottom:2px">From</label>
+          <input type="date" id="fetch-from" style="width:100%">
         </div>
-        <div class="form-group" style="margin-bottom:0">
-          <label for="fetch-to">To</label>
-          <input type="date" id="fetch-to">
+        <div style="min-width:120px">
+          <label for="fetch-to" style="margin-bottom:2px">To</label>
+          <input type="date" id="fetch-to" style="width:100%">
         </div>
-        <div class="form-group" style="margin-bottom:0">
-          <label for="fetch-max">Max per cat.</label>
-          <input type="number" id="fetch-max" value="50" min="1" max="500">
+        <div style="width:70px">
+          <label for="fetch-max" style="margin-bottom:2px">Max</label>
+          <input type="number" id="fetch-max" value="50" min="1" max="500" style="width:100%">
         </div>
-      </div>
-
-      <div style="margin-top:14px; display:flex; gap:10px; align-items:center">
-        <button class="btn btn-primary" id="fetch-btn" onclick="fetchPapers()">Fetch &amp; Filter</button>
         <span id="fetch-status" style="font-size:12px;color:var(--text-dim)"></span>
       </div>
       <div id="fetch-error"></div>
     </div>
 
-    <div id="papers-body">
-      <div id="papers-col">
+    <div id="discovery-columns">
+      <div id="disc-left"></div>
+      <div id="disc-middle">
         <div id="fetch-results"></div>
-        <div id="save-bar" style="display:none">
-          <span id="save-count">0 selected</span>
-          <button class="btn btn-primary" onclick="saveSelected()">Save to Library</button>
-          <button class="btn" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-dim)" onclick="clearSelection()">Clear</button>
+      </div>
+      <div id="disc-right">
+        <div id="detail-panel-header">
+          <span id="detail-panel-title">Paper</span>
+        </div>
+        <div id="detail-panel-body">
+          <div class="empty">Select a paper to view details</div>
         </div>
       </div>
+    </div>
+    <div id="save-bar" style="display:none">
+      <span id="save-count">0 selected</span>
+      <button class="btn btn-primary" id="analyze-sel-btn" onclick="analyzeSelected()">Analyze</button>
+      <button class="btn btn-primary" onclick="saveSelected()">Save to Library</button>
+      <button class="btn" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-dim)" onclick="clearSelection()">Clear</button>
     </div>
 
   </div>
@@ -92,10 +76,49 @@
   <!-- ════════════════════════════════════════ LIBRARY TAB ════ -->
   <div id="tab-library" class="tab">
 
-    <div id="library-body">
-      <div id="library-col">
-        <div id="library-summary"></div>
-        <div id="library-list"></div>
+    <div id="library-columns">
+      <div id="lib-left"></div>
+      <div id="lib-middle">
+        <div id="lib-summary"></div>
+        <div id="lib-results"></div>
+      </div>
+      <div id="lib-right">
+        <div id="lib-detail-header">
+          <span id="lib-detail-title">Paper</span>
+        </div>
+        <div id="lib-detail-body">
+          <div class="empty">Select a paper to view details</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ════════════════════════════════════════ TOPICS TAB ════ -->
+  <div id="tab-topics" class="tab">
+
+    <div id="topics-columns">
+      <div id="topics-left">
+        <h3>Topics</h3>
+        <div id="topics-list"></div>
+        <div id="add-topic-section">
+          <div class="form-group" style="margin-bottom:8px">
+            <input type="text" id="new-topic-name" placeholder="New topic name…" style="width:100%">
+          </div>
+          <div class="form-group" style="margin-bottom:8px">
+            <input type="text" id="new-topic-keywords" placeholder="Keywords (comma-separated)" style="width:100%">
+          </div>
+          <button class="btn btn-primary" style="width:100%;font-size:12px;padding:5px 0" onclick="addTopic()">Add Topic</button>
+          <div id="add-error"></div>
+        </div>
+      </div>
+      <div id="topics-right">
+        <div id="topic-detail-header">
+          <span id="topic-detail-title">Topic</span>
+        </div>
+        <div id="topic-detail-body">
+          <div class="empty">Select a topic to view details</div>
+        </div>
       </div>
     </div>
 
@@ -103,12 +126,13 @@
 
 </main>
 
-<div id="detail-panel">
-  <div id="detail-panel-header">
-    <span id="detail-panel-title"></span>
-    <button id="detail-panel-close" onclick="closeDetailPanel()">×</button>
+<div id="log-panel" class="log-panel collapsed">
+  <div class="log-panel-header" onclick="toggleLogPanel()">
+    <span class="log-panel-title">Log</span>
+    <span id="log-badge" class="log-badge" style="display:none">0</span>
+    <span class="log-panel-chevron">&#9650;</span>
   </div>
-  <div id="detail-panel-body"></div>
+  <div class="log-panel-body" id="log-panel-body"></div>
 </div>
 
 <script src="{{ url_for('static', filename='app.js') }}"></script>

@@ -1,16 +1,49 @@
 {
   "topics": [
     {
-      "name": "Neural Materials",
-      "keywords": ["neural material", "BRDF", "reflectance", "appearance model", "material appearance", "neural appearance"],
-      "description": "",
+      "name": "Neural BRDF",
+      "description": "Neural network models that learn to represent, approximate, or generalize the bidirectional reflectance distribution function (BRDF), which describes how a surface reflects light as a function of incoming and outgoing directions. Classical analytic BRDFs (GGX, Cook-Torrance, Disney) are compact but limited in expressiveness; measured BRDFs (e.g. the MERL database) are accurate but high-dimensional and hard to interpolate. Neural BRDFs sit in between: they can faithfully reproduce complex reflectance behaviors — including anisotropy, retroreflection, multi-lobe specular, and wave-optics effects — while supporting gradient-based optimization, interpolation in a latent space, and real-time evaluation. Key sub-themes include fitting and compressing measured BRDF data with autoencoders or coordinate networks; physics-based priors such as reciprocity and energy conservation encoded into the architecture or loss; BRDF estimation from images via differentiable rendering; generative BRDF models that learn a low-dimensional manifold of plausible materials; and efficient inference architectures (tiny-MLP, factored representations) that make neural BRDFs practical in real-time shaders. The spatially-varying extension (SVBRDF) is closely related and often in scope.",
+      "keywords": [
+        "Neural BRDF",
+        "SVBRDF",
+        "measured BRDF",
+        "BRDF latent space",
+        "BRDF autoencoder",
+        "generative BRDF",
+        "physics-informed BRDF",
+        "microfacet model",
+        "differentiable BRDF",
+        "inverse rendering",
+        "single-image SVBRDF",
+        "BRDF importance sampling",
+        "real-time BRDF",
+        "tiny-MLP shader"
+      ],
       "papers": []
     },
     {
-      "name": "3D Gaussian Splatting",
-      "keywords": ["gaussian splatting", "3DGS", "gaussian splat", "radiance field", "NeRF", "neural radiance"],
-      "description": "",
-      "papers": []
+      "name": "Relightable Gaussian Splatting",
+      "description": "Methods that extend 3D Gaussian splatting (3DGS) to support rendering under novel, user-controlled illumination by disentangling geometry, material, and lighting within the Gaussian primitive representation. Standard 3DGS bakes lighting into Gaussian color/opacity attributes, producing photo-realistic but illumination-locked reconstructions. Relightable variants attach per-Gaussian BRDF parameters and explicit lighting representations so that a scene reconstructed from images can be re-rendered under arbitrary new light conditions (including environment maps, point lights, and dynamic illumination) while preserving real-time or near-real-time rendering speed. The field spans appearance decomposition within Gaussian primitives, lighting representation (spherical harmonics, spherical Gaussians, neural incident light fields), shadow and visibility computation in Gaussian scenes, inverse rendering with Gaussians, deferred shading pipelines, and improved surface/normal estimation for accurate reflectance decomposition.",
+      "keywords": [
+        "relightable Gaussian splatting",
+        "3D Gaussian splatting",
+        "3DGS",
+        "2D Gaussian splatting",
+        "appearance decomposition",
+        "per-Gaussian BRDF",
+        "Gaussian PBR",
+        "inverse rendering",
+        "spherical harmonics",
+        "spherical Gaussians",
+        "environment map relighting",
+        "image-based lighting",
+        "visibility in 3DGS",
+        "shadow in 3DGS",
+        "real-time relighting",
+        "Gaussian opacity fields",
+        "multi-view inverse rendering",
+        "material editing in 3DGS"
+      ]
     }
   ]
 }
