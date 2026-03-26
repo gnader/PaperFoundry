@@ -1,49 +1,75 @@
 {
   "topics": [
     {
-      "name": "Neural BRDF",
-      "description": "Neural network models that learn to represent, approximate, or generalize the bidirectional reflectance distribution function (BRDF), which describes how a surface reflects light as a function of incoming and outgoing directions. Classical analytic BRDFs (GGX, Cook-Torrance, Disney) are compact but limited in expressiveness; measured BRDFs (e.g. the MERL database) are accurate but high-dimensional and hard to interpolate. Neural BRDFs sit in between: they can faithfully reproduce complex reflectance behaviors — including anisotropy, retroreflection, multi-lobe specular, and wave-optics effects — while supporting gradient-based optimization, interpolation in a latent space, and real-time evaluation. Key sub-themes include fitting and compressing measured BRDF data with autoencoders or coordinate networks; physics-based priors such as reciprocity and energy conservation encoded into the architecture or loss; BRDF estimation from images via differentiable rendering; generative BRDF models that learn a low-dimensional manifold of plausible materials; and efficient inference architectures (tiny-MLP, factored representations) that make neural BRDFs practical in real-time shaders. The spatially-varying extension (SVBRDF) is closely related and often in scope.",
-      "keywords": [
-        "Neural BRDF",
-        "SVBRDF",
-        "measured BRDF",
-        "BRDF latent space",
-        "BRDF autoencoder",
-        "generative BRDF",
-        "physics-informed BRDF",
-        "microfacet model",
-        "differentiable BRDF",
-        "inverse rendering",
-        "single-image SVBRDF",
-        "BRDF importance sampling",
-        "real-time BRDF",
-        "tiny-MLP shader"
-      ],
-      "papers": []
+        "name": "Neural BRDF",
+        "description": "Neural network models that learn to represent, approximate, or generalize the bidirectional reflectance distribution function (BRDF), which describes how a surface reflects light as a function of incoming and outgoing directions. Classical analytic BRDFs (GGX, Cook-Torrance, Disney) are compact but limited in expressiveness; measured BRDFs (e.g. the MERL database) are accurate but high-dimensional and hard to interpolate. Neural BRDFs sit in between: they can faithfully reproduce complex reflectance behaviors — including anisotropy, retroreflection, multi-lobe specular, and wave-optics effects — while supporting gradient-based optimization, interpolation in a latent space, and real-time evaluation. Key sub-themes include fitting and compressing measured BRDF data with autoencoders or coordinate networks; physics-based priors such as reciprocity and energy conservation encoded into the architecture or loss; BRDF estimation from images via differentiable rendering; generative BRDF models that learn a low-dimensional manifold of plausible materials; and efficient inference architectures (tiny-MLP, factored representations) that make neural BRDFs practical in real-time shaders. The spatially-varying extension (SVBRDF) is closely related and often in scope.",
+        "keywords": [
+            "Neural BRDF",
+            "SVBRDF",
+            "measured BRDF",
+            "BRDF latent space",
+            "BRDF autoencoder",
+            "generative BRDF",
+            "physics-informed BRDF",
+            "microfacet model",
+            "differentiable BRDF",
+            "inverse rendering",
+            "single-image SVBRDF",
+            "BRDF importance sampling",
+            "real-time BRDF",
+            "tiny-MLP shader"
+        ],
+        "papers": []
     },
     {
-      "name": "Relightable Gaussian Splatting",
-      "description": "Methods that extend 3D Gaussian splatting (3DGS) to support rendering under novel, user-controlled illumination by disentangling geometry, material, and lighting within the Gaussian primitive representation. Standard 3DGS bakes lighting into Gaussian color/opacity attributes, producing photo-realistic but illumination-locked reconstructions. Relightable variants attach per-Gaussian BRDF parameters and explicit lighting representations so that a scene reconstructed from images can be re-rendered under arbitrary new light conditions (including environment maps, point lights, and dynamic illumination) while preserving real-time or near-real-time rendering speed. The field spans appearance decomposition within Gaussian primitives, lighting representation (spherical harmonics, spherical Gaussians, neural incident light fields), shadow and visibility computation in Gaussian scenes, inverse rendering with Gaussians, deferred shading pipelines, and improved surface/normal estimation for accurate reflectance decomposition.",
-      "keywords": [
-        "relightable Gaussian splatting",
-        "3D Gaussian splatting",
-        "3DGS",
-        "2D Gaussian splatting",
-        "appearance decomposition",
-        "per-Gaussian BRDF",
-        "Gaussian PBR",
-        "inverse rendering",
-        "spherical harmonics",
-        "spherical Gaussians",
-        "environment map relighting",
-        "image-based lighting",
-        "visibility in 3DGS",
-        "shadow in 3DGS",
-        "real-time relighting",
-        "Gaussian opacity fields",
-        "multi-view inverse rendering",
-        "material editing in 3DGS"
-      ]
+        "name": "Generative Rendering",
+        "description": "Methods that use generative models — diffusion models, GANs, VAEs, and autoregressive networks — to synthesize, augment, or replace components of the physically-based rendering pipeline. Rather than simulating light transport from first principles, generative rendering models learn image distributions from data and can produce photorealistic outputs, novel views, or relighted scenes at a fraction of the computational cost of classical rendering. The field spans several interconnected directions: text- or image-conditioned generation of 3D-consistent scenes and objects; neural rendering pipelines where generative models replace or accelerate specific steps (denoising, shading, super-resolution, anti-aliasing); diffusion-based inverse rendering that recovers scene parameters by inverting a generative prior; generative models of lighting and illumination; and the use of large pretrained diffusion models (Stable Diffusion, ControlNet) as priors for 3D reconstruction, relighting, and material estimation. A key theme is the tension between photorealism and physical correctness — generative models can hallucinate plausible-looking but physically inconsistent results, and much recent work focuses on grounding generation in geometry, material, or lighting constraints. Related areas include neural radiance field generation, feed-forward 3D generation from single images, and video diffusion models applied to dynamic scene synthesis.",
+        "keywords": [
+            "generative rendering",
+            "diffusion model rendering",
+            "neural rendering",
+            "text-to-3D",
+            "image-to-3D",
+            "score distillation sampling (SDS)",
+            "diffusion-based inverse rendering",
+            "generative relighting",
+            "generative material synthesis",
+            "NeRF generation",
+            "feed-forward 3D generation",
+            "3D-consistent image synthesis",
+            "diffusion prior for reconstruction",
+            "ControlNet / conditioned diffusion",
+            "GAN-based rendering",
+            "neural denoising",
+            "generative novel view synthesis",
+            "video diffusion for scenes",
+            "latent diffusion model",
+            "physically-grounded generation"
+        ]
+    },
+    {
+        "name": "Relightable Gaussian Splatting",
+        "description": "Methods that extend 3D Gaussian splatting (3DGS) to support rendering under novel, user-controlled illumination by disentangling geometry, material, and lighting within the Gaussian primitive representation. Standard 3DGS bakes lighting into Gaussian color/opacity attributes, producing photo-realistic but illumination-locked reconstructions. Relightable variants attach per-Gaussian BRDF parameters and explicit lighting representations so that a scene reconstructed from images can be re-rendered under arbitrary new light conditions (including environment maps, point lights, and dynamic illumination) while preserving real-time or near-real-time rendering speed. The field spans appearance decomposition within Gaussian primitives, lighting representation (spherical harmonics, spherical Gaussians, neural incident light fields), shadow and visibility computation in Gaussian scenes, inverse rendering with Gaussians, deferred shading pipelines, and improved surface/normal estimation for accurate reflectance decomposition.",
+        "keywords": [
+            "relightable Gaussian splatting",
+            "3D Gaussian splatting",
+            "3DGS",
+            "2D Gaussian splatting",
+            "appearance decomposition",
+            "per-Gaussian BRDF",
+            "Gaussian PBR",
+            "inverse rendering",
+            "spherical harmonics",
+            "spherical Gaussians",
+            "environment map relighting",
+            "image-based lighting",
+            "visibility in 3DGS",
+            "shadow in 3DGS",
+            "real-time relighting",
+            "Gaussian opacity fields",
+            "multi-view inverse rendering",
+            "material editing in 3DGS"
+        ]
     }
   ]
 }
