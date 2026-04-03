@@ -19,7 +19,14 @@
             "real-time BRDF",
             "tiny-MLP shader"
         ],
-        "papers": []
+        "ignore_words": ["graphics", "generative"],
+        "papers": [
+            {
+                "title": "Real-Time Neural Appearance Models",
+                "authors": "Zeltner",
+                "year": 2024
+            }
+        ]
     },
     {
         "name": "Generative Rendering",
@@ -45,7 +52,8 @@
             "video diffusion for scenes",
             "latent diffusion model",
             "physically-grounded generation"
-        ]
+        ],
+        "ignore_words": ["graphics"]
     },
     {
         "name": "Relightable Gaussian Splatting",
@@ -69,7 +77,8 @@
             "Gaussian opacity fields",
             "multi-view inverse rendering",
             "material editing in 3DGS"
-        ]
+        ],
+        "ignore_words": ["graphics", "generative"]
     }
   ]
 }
