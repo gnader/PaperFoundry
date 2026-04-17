@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
@@ -79,7 +80,14 @@ class ArxivFetcher:
     # Public
     # ------------------------------------------------------------------
 
-    def fetch(self, source: str, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Paper]:
+    def fetch(
+        self,
+        source: str,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        known_ids: Optional[set] = None,
+        target_new: Optional[int] = None,
+    ) -> List[Paper]:
         """Fetch papers from a category name or an arXiv listing URL.
 
         Args:
@@ -87,6 +95,11 @@ class ArxivFetcher:
                     "https://arxiv.org/list/cs.GR/recent".
             date_from: Start date in YYYYMMDD format (inclusive), or None.
             date_to: End date in YYYYMMDD format (inclusive), or None.
+            known_ids: Set of paper IDs already in the output file. When
+                       provided, fetching paginates until *target_new* unseen
+                       papers are collected (or arXiv is exhausted).
+            target_new: How many new (unseen) papers to collect. Defaults to
+                        self.max_results.
 
         Returns:
             List of Paper objects, most recent first.
@@ -94,22 +107,56 @@ class ArxivFetcher:
         category = self._resolve_category(source)
         date_info = ""
         if date_from or date_to:
-            date_info = f" [{date_from or '...'} → {date_to or 'now'}]"
-        print(f"Fetching arxiv:{category}{date_info} (up to {self.max_results} papers)...")
+            date_info = f" [{date_from or '...'} -> {date_to or 'now'}]"
 
-        params = {
-            "search_query": self._build_query(category, date_from, date_to),
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-            "max_results": self.max_results,
-        }
+        if target_new is None:
+            target_new = self.max_results
 
-        response = self.session.get(self.API_URL, params=params, timeout=20)
-        response.raise_for_status()
+        if known_ids:
+            print(f"Fetching arxiv:{category}{date_info} ({len(known_ids)} known, looking for {target_new} new)...")
+        else:
+            print(f"Fetching arxiv:{category}{date_info} (up to {target_new} papers)...")
 
-        papers = self._parse_atom(response.text, source_tag=f"arxiv:{category}")
-        print(f"  -> {len(papers)} papers retrieved.")
-        return papers
+        query = self._build_query(category, date_from, date_to)
+        source_tag = f"arxiv:{category}"
+        batch_size = self.max_results
+        new_papers: List[Paper] = []
+        start = 0
+
+        while len(new_papers) < target_new:
+            params = {
+                "search_query": query,
+                "sortBy": "submittedDate",
+                "sortOrder": "descending",
+                "start": start,
+                "max_results": batch_size,
+            }
+
+            response = self.session.get(self.API_URL, params=params, timeout=20)
+            response.raise_for_status()
+
+            batch = self._parse_atom(response.text, source_tag=source_tag)
+
+            if not batch:
+                break
+
+            for paper in batch:
+                if known_ids and paper.id in known_ids:
+                    continue
+                new_papers.append(paper)
+                if len(new_papers) >= target_new:
+                    break
+
+            if known_ids and len(new_papers) < target_new:
+                print(f"  -> {len(new_papers)} new so far ({start + len(batch)} checked)...")
+
+            if len(batch) < batch_size:
+                break
+
+            start += batch_size
+
+        print(f"  -> {len(new_papers)} new papers retrieved.")
+        return new_papers
 
     # ------------------------------------------------------------------
     # Private
@@ -189,14 +236,28 @@ class LiteratureMonitor:
     def __init__(self, max_results: int = 50):
         self.arxiv = ArxivFetcher(max_results=max_results)
 
-    def fetch_all(self, sources: List[str], date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Paper]:
-        """Fetch from all sources and return a deduplicated, date-sorted list."""
+    def fetch_all(
+        self,
+        sources: List[str],
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        known_ids: Optional[set] = None,
+        target_new: Optional[int] = None,
+    ) -> List[Paper]:
+        """Fetch from all sources and return a deduplicated, date-sorted list.
+
+        When *known_ids* is provided the fetcher paginates past already-seen
+        papers so that up to *target_new* genuinely new papers are returned.
+        """
         all_papers: List[Paper] = []
-        seen_ids: set = set()
+        seen_ids: set = set(known_ids) if known_ids else set()
 
         for source in sources:
             try:
-                papers = self._fetch_source(source, date_from, date_to)
+                papers = self._fetch_source(
+                    source, date_from, date_to,
+                    known_ids=known_ids, target_new=target_new,
+                )
                 for paper in papers:
                     if paper.id not in seen_ids:
                         seen_ids.add(paper.id)
@@ -208,11 +269,12 @@ class LiteratureMonitor:
         all_papers.sort(key=lambda p: p.published, reverse=True)
         return all_papers
 
-    def _fetch_source(self, source: str, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Paper]:
+    def _fetch_source(self, source: str, date_from=None, date_to=None, known_ids=None, target_new=None) -> List[Paper]:
         """Route a source string to the right fetcher."""
         # Currently only arXiv is supported; extend here for other sites
         if "arxiv.org" in source or re.match(r"^[a-z]+\.[A-Z]+$", source):
-            return self.arxiv.fetch(source, date_from=date_from, date_to=date_to)
+            return self.arxiv.fetch(source, date_from=date_from, date_to=date_to,
+                                    known_ids=known_ids, target_new=target_new)
         raise ValueError(f"Unsupported source: '{source}'. Only arXiv URLs/categories are supported.")
 
     @staticmethod
@@ -233,6 +295,13 @@ class LiteratureMonitor:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         return [Paper(**p) for p in data["papers"]]
+
+    @staticmethod
+    def load_ids(path: str) -> set:
+        """Load just the paper IDs from a previously saved JSON file."""
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return {p["id"] for p in data["papers"]}
 
 
 # ============================================================================
@@ -268,6 +337,12 @@ Examples:
         help="Max papers to fetch per source (default: 50).",
     )
     parser.add_argument(
+        "--date",
+        metavar="DATE",
+        type=_parse_date_arg,
+        help="Fetch papers for a single date (YYYY-MM-DD). Cannot be combined with --from/--to.",
+    )
+    parser.add_argument(
         "--from",
         dest="date_from",
         metavar="DATE",
@@ -283,20 +358,51 @@ Examples:
     )
     args = parser.parse_args()
 
-    monitor = LiteratureMonitor(max_results=args.max)
-    papers = monitor.fetch_all(args.sources, date_from=args.date_from, date_to=args.date_to)
+    # --date is shorthand for --from DATE --to DATE
+    if args.date:
+        if args.date_from or args.date_to:
+            parser.error("--date cannot be combined with --from/--to")
+        args.date_from = args.date
+        args.date_to = args.date
 
-    # Print a quick summary
-    print(f"\n{'─' * 60}")
+    # Load existing papers from output file if it exists
+    existing_papers: List[Paper] = []
+    known_ids: set = set()
+    if os.path.isfile(args.output):
+        try:
+            existing_papers = LiteratureMonitor.load(args.output)
+            known_ids = {p.id for p in existing_papers}
+            print(f"Loaded {len(known_ids)} existing papers from {args.output}")
+        except Exception as e:
+            print(f"  [warning] Could not load {args.output}: {e}")
+
+    monitor = LiteratureMonitor(max_results=args.max)
+    new_papers = monitor.fetch_all(
+        args.sources,
+        date_from=args.date_from,
+        date_to=args.date_to,
+        known_ids=known_ids if known_ids else None,
+        target_new=args.max,
+    )
+
+    # Merge: new papers first, then existing
+    all_papers = new_papers + existing_papers
+    all_papers.sort(key=lambda p: p.published, reverse=True)
+
+    # Print a quick summary of new papers
+    print(f"\n{'-' * 60}")
+    if known_ids:
+        print(f"Added {len(new_papers)} new papers ({len(all_papers)} total)")
     print(f"{'Title':<55} {'Date':<12}")
-    print(f"{'─' * 60}")
-    for p in papers[:20]:
+    print(f"{'-' * 60}")
+    display = new_papers if known_ids else all_papers
+    for p in display[:20]:
         date = p.published[:10]
         print(f"{p.title[:54]:<55} {date}")
-    if len(papers) > 20:
-        print(f"  ... and {len(papers) - 20} more")
+    if len(display) > 20:
+        print(f"  ... and {len(display) - 20} more")
 
-    monitor.save(papers, args.output)
+    monitor.save(all_papers, args.output)
 
 
 if __name__ == "__main__":
