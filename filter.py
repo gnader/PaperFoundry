@@ -1,22 +1,40 @@
-"""Topic-based paper filter.
+"""Topic-based paper filter using a local LLM.
 
-Reads a papers.json file (produced by monitor.py) and a topics.json config,
-then matches papers against topic keywords and outputs the results.
+Reads a papers.json file (produced by monitor.py) and a topics.json config, then uses a local LLM
+(via LLMClient / Ollama) to judge whether each paper is relevant to each topic.
+
+Two modes (planned):
+  fast — LLM reads title + abstract, returns verdict + confidence + reasoning (this file)
+  deep — downloads PDF, extracts full text, LLM does deeper analysis (future DeepFilter)
 
 Usage:
-    python filter.py papers.json --topics topics.json [-o filtered.json]
+    python filter.py papers.json --model gemma4:e2b
+    python filter.py papers.json --model gemma4:e2b --topics topics.json -o filtered.json
+    python filter.py papers.json --model gemma4:e2b --paper 2603.11969 --verbose
 """
 
 import argparse
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
+
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
-# ============================================================================
+def _load_prompt(name: str, prompts_dir: Path = None) -> str:
+    """Load a prompt template from the prompts directory."""
+    path = (prompts_dir or PROMPTS_DIR) / name
+    if not path.is_file():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+# ===========================================================================================================================
 # Data model
-# ============================================================================
+# ===========================================================================================================================
 
 
 @dataclass
@@ -24,12 +42,12 @@ class Topic:
     name: str
     keywords: List[str]
     description: str = ""
-    papers: List[str] = field(default_factory=list)
+    papers: List[dict] = field(default_factory=list)
 
 
-# ============================================================================
+# ===========================================================================================================================
 # I/O helpers
-# ============================================================================
+# ===========================================================================================================================
 
 
 def load_papers(path: str) -> List[dict]:
@@ -54,12 +72,14 @@ def load_topics(path: str) -> List[Topic]:
         keywords = t.get("keywords", [])
         if not isinstance(keywords, list):
             raise ValueError(f"Topic '{name}': 'keywords' must be a list")
-        topics.append(Topic(
-            name=name,
-            keywords=[str(k) for k in keywords],
-            description=t.get("description", ""),
-            papers=t.get("papers", []),
-        ))
+        topics.append(
+            Topic(
+                name=name,
+                keywords=[str(k) for k in keywords],
+                description=t.get("description", ""),
+                papers=t.get("papers", []),
+            )
+        )
     if not topics:
         raise ValueError(f"No topics found in {path!r}")
     return topics
@@ -73,14 +93,7 @@ def save_results(results: Dict[str, List[dict]], source_file: str, topics_file: 
         "source_file": source_file,
         "topics_file": topics_file,
         "total_matched_papers": total,
-        "results": [
-            {
-                "topic": topic_name,
-                "match_count": len(papers),
-                "papers": papers,
-            }
-            for topic_name, papers in results.items()
-        ],
+        "results": [{"topic": topic_name, "match_count": len(papers), "papers": papers} for topic_name, papers in results.items()],
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
@@ -94,110 +107,216 @@ def format_results(results: Dict[str, List[dict]]) -> None:
         return
 
     for topic_name, papers in results.items():
-        print(f"\n{topic_name}  ({len(papers)} paper{'s' if len(papers) != 1 else ''})")
+        n_match = sum(1 for p in papers if p.get("match_level") == "match")
+        n_maybe = sum(1 for p in papers if p.get("match_level") == "maybe")
+        counts = f"{n_match} match"
+        if n_maybe:
+            counts += f", {n_maybe} maybe"
+        print(f"\n{topic_name}  ({counts})")
         for paper in papers:
             date = (paper.get("published") or "")[:10]
             title = paper.get("title", "(no title)")
             url = paper.get("url", "")
-            keywords = paper.get("matched_keywords", [])
-            print(f"  [{date}] {title}")
-            if keywords:
-                print(f"           Keywords: {', '.join(keywords)}")
+            level = paper.get("match_level", "")
+            reason = paper.get("reason", "")
+
+            tag = " [MAYBE]" if level == "maybe" else ""
+
+            print(f"  [{date}] {title}{tag}")
+            if reason:
+                print(f"           {reason}")
             if url:
                 print(f"           {url}")
 
 
-# ============================================================================
-# Matching logic
-# ============================================================================
+# ===========================================================================================================================
+# FastFilter
+# ===========================================================================================================================
 
 
-def match_paper(paper: dict, topic: Topic) -> List[str]:
-    """Return the list of topic keywords found in the paper's title + abstract."""
-    title = paper.get("title", "") or ""
-    abstract = paper.get("abstract", "") or ""
-    haystack = (title + " " + abstract).lower()
-    return [kw for kw in topic.keywords if kw.lower() in haystack]
+class FastFilter:
+    """LLM-based paper filter using title + abstract.
 
+    For each (topic, paper) pair, builds a prompt with the topic description/keywords and the paper's
+    title + abstract, sends it to the LLM, and parses a structured JSON verdict.
 
-class TopicFilter:
-    def __init__(self, topics: List[Topic]):
-        self.topics = topics
+    Prompts are loaded from external text files in the prompts/ directory.
+    """
 
-    def run(self, papers: List[dict]) -> Dict[str, List[dict]]:
-        """Match papers against all topics.
+    def __init__(self, llm, verbose: bool = False, prompts_dir: Path = None):
+        self.llm = llm
+        self.verbose = verbose
+        self.system_prompt = _load_prompt("fast_system.txt", prompts_dir)
+        self.user_template = _load_prompt("fast_user.txt", prompts_dir)
 
-        Returns a dict mapping topic name → list of matching paper dicts.
-        Each paper dict is a copy of the original with an added
-        'matched_keywords' field. Topics with zero matches are omitted.
-        A paper can appear under multiple topics.
+    def build_prompt(self, topic: Topic, paper: dict) -> str:
+        """Build the user prompt for a single (topic, paper) pair."""
+        return self.user_template.format(
+            topic_name=topic.name,
+            description=topic.description,
+            keywords=", ".join(topic.keywords) if topic.keywords else "(none)",
+            title=paper.get("title", "(no title)"),
+            abstract=paper.get("abstract", "(no abstract)"),
+        )
+
+    def parse_response(self, raw: str) -> dict:
+        """Parse the LLM's JSON response into a structured dict.
+
+        Handles markdown fences, malformed JSON, and missing fields gracefully.
         """
+        text = raw.strip()
+
+        # Strip markdown code fences if present
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return {"verdict": "error", "reason": f"Failed to parse LLM response: {raw[:200]}"}
+
+        # Validate and normalize fields
+        verdict = str(data.get("verdict", "error")).lower().strip()
+        if verdict not in ("match", "maybe", "no"):
+            verdict = "error"
+
+        reason = str(data.get("reason", "")).strip()
+
+        return {"verdict": verdict, "reason": reason}
+
+    def score(self, topic: Topic, paper: dict) -> dict:
+        """Score a single paper against a single topic. Returns an enriched paper dict (or None if no match)."""
+        prompt = self.build_prompt(topic, paper)
+
+        if self.verbose:
+            print(f"\n{'=' * 120}")
+            print(f"[prompt]\n{prompt}")
+            print(f"{'=' * 120}")
+
+        raw = self.llm.generate(prompt=prompt, system=self.system_prompt, format="json")
+
+        if self.verbose:
+            print(f"[response] {raw}")
+
+        result = self.parse_response(raw)
+
+        if result["verdict"] in ("match", "maybe"):
+            return {
+                "id": paper.get("id", ""),
+                "title": paper.get("title", ""),
+                "authors": paper.get("authors", []),
+                "published": paper.get("published", ""),
+                "url": paper.get("url", ""),
+                "match_level": result["verdict"],
+                "reason": result["reason"],
+            }
+        return None
+
+    def run(self, topics: List[Topic], papers: List[dict]) -> Dict[str, List[dict]]:
+        """Score all papers against all topics. Returns {topic_name: [matched_papers]}."""
         results: Dict[str, List[dict]] = {}
 
-        for topic in self.topics:
+        for topic in topics:
             matched = []
-            for paper in papers:
-                hits = match_paper(paper, topic)
-                if hits:
-                    # Compact copy — no abstract, just what's needed for triage
-                    matched.append({
-                        "id": paper.get("id", ""),
-                        "title": paper.get("title", ""),
-                        "authors": paper.get("authors", []),
-                        "published": paper.get("published", ""),
-                        "url": paper.get("url", ""),
-                        "matched_keywords": hits,
-                    })
+            for i, paper in enumerate(papers):
+                pid = paper.get("id", "?")
+                print(f"  [{topic.name}] Scoring paper {i + 1}/{len(papers)}: {pid}", end="\r")
+                result = self.score(topic, paper)
+                if result is not None:
+                    matched.append(result)
+            print(f"  [{topic.name}] Done — {len(matched)} matched out of {len(papers)} papers" + " " * 30)
+
             if matched:
+                matched.sort(key=lambda p: 0 if p.get("match_level") == "match" else 1)
                 results[topic.name] = matched
 
         return results
 
 
-# ============================================================================
+# ===========================================================================================================================
 # CLI
-# ============================================================================
+# ===========================================================================================================================
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Filter papers by topic keywords.",
+        description="Filter papers by topic relevance using a local LLM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python filter.py papers.json
-  python filter.py papers.json --topics topics.json -o filtered.json
-        """,
+  python filter.py papers.json --model gemma4:e2b
+  python filter.py papers.json --model gemma4:e2b --topics topics.json -o filtered.json
+  python filter.py papers.json --model gemma4:e2b --paper 2603.11969 --verbose
+    """,
     )
-    parser.add_argument(
-        "papers",
-        help="Path to papers.json produced by monitor.py.",
-    )
-    parser.add_argument(
-        "--topics",
-        default="topics.json",
-        metavar="FILE",
-        help="Path to topics.json config (default: topics.json).",
-    )
-    parser.add_argument(
-        "-o", "--output",
-        metavar="FILE",
-        help="Write filtered results to this JSON file.",
-    )
+    parser.add_argument("papers", help="Path to papers.json produced by monitor.py.")
+    parser.add_argument("--topics", default="topics.json", metavar="FILE", help="Path to topics.json config (default: topics.json).")
+    parser.add_argument("-o", "--output", metavar="FILE", help="Write filtered results to this JSON file.")
+    parser.add_argument("--model", help="Ollama model name (e.g. gemma4:e2b). Not required with --dry-run.")
+    parser.add_argument("--host", default="http://localhost:11434", help="Ollama host (default: http://localhost:11434).")
+    parser.add_argument("--keep-alive", default="30m", help='Keep model in VRAM for this duration (default: 30m). Use "-1" for forever.')
+    parser.add_argument("--paper", metavar="ID", help="Run on a single paper by ID (for debugging).")
+    parser.add_argument("--verbose", action="store_true", help="Print prompts and raw LLM responses.")
+    parser.add_argument("--unload", action="store_true", help="Unload the model from VRAM after filtering is done.")
+    parser.add_argument("--dry-run", action="store_true", help="Print the prompts that would be sent to the LLM without actually calling it. No model needed.")
+    parser.add_argument("--prompts", default=None, metavar="DIR", help="Prompts directory (default: prompts/ next to filter.py).")
+
     args = parser.parse_args()
 
+    prompts_dir = Path(args.prompts) if args.prompts else None
+
+    # Load data
     papers = load_papers(args.papers)
     topics = load_topics(args.topics)
 
-    print(f"Loaded {len(papers)} papers, {len(topics)} topic(s).")
+    if args.paper:
+        papers = [p for p in papers if p.get("id") == args.paper]
+        if not papers:
+            print(f"Paper '{args.paper}' not found in {args.papers}")
+            return
 
-    filt = TopicFilter(topics)
-    results = filt.run(papers)
+    # Dry-run mode: just print prompts, no LLM needed
+    if args.dry_run:
+        filt = FastFilter(llm=None, verbose=False, prompts_dir=prompts_dir)
+        for topic in topics:
+            for paper in papers:
+                pid = paper.get("id", "?")
+                print(f"{'=' * 120}")
+                print(f"[system]\n{filt.system_prompt}\n")
+                print(f"[user] topic={topic.name}  paper={pid}")
+                print(filt.build_prompt(topic, paper))
+        print(f"{'=' * 120}")
+        print(f"\n{len(topics)} topic(s) x {len(papers)} paper(s) = {len(topics) * len(papers)} prompt(s)")
+        return
 
+    if not args.model:
+        parser.error("--model is required (unless using --dry-run)")
+
+    print(f"Loaded {len(papers)} paper(s), {len(topics)} topic(s). Model: {args.model}")
+
+    # Set up LLM
+    from llm import LLMClient
+
+    client = LLMClient(model=args.model, host=args.host)
+    ok, msg = client.load(keep_alive=args.keep_alive)
+    if not ok:
+        print(f"Failed to load model: {msg}")
+        return
+    print(msg)
+
+    # Run filter
+    filt = FastFilter(llm=client, verbose=args.verbose, prompts_dir=prompts_dir)
+    results = filt.run(topics, papers)
+
+    # Output
     format_results(results)
-
     if args.output:
         save_results(results, args.papers, args.topics, args.output)
+
+    if args.unload:
+        ok, msg = client.unload()
+        print(msg)
 
 
 if __name__ == "__main__":
