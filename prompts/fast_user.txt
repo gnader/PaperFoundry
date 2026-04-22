@@ -1,8 +1,0 @@
-## Topic
-Name: {topic_name}
-Description: {description}
-Keywords: {keywords}
-
-## Paper
-Title: {title}
-Abstract: {abstract}

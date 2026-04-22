@@ -5,107 +5,129 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Extract references and metadata from a PDF
-python bibextract.py paper.pdf -o output.json --top 10
+# --- monitor.py ---------------------------------------------------------------
 
-# Dump extracted full text for debugging
-python bibextract.py paper.pdf --debug-text
+# Fetch recent papers from an arXiv category (writes/updates papers.json)
+python monitor.py cs.GR
 
-# Enrich references with OpenAlex metadata (rate-limited, slow)
-python bibextract.py paper.pdf --enrich
+# Multiple categories, custom output, higher per-source cap
+python monitor.py cs.GR cs.CV cs.LG -o papers.json --max 100
 
-# Monitor arXiv categories for new papers
-python monitor.py cs.GR cs.CV -o papers.json --max 50
+# Fetch from a listing URL instead of a bare category
 python monitor.py https://arxiv.org/list/cs.GR/recent
 
-# Monitor with date range
+# Single-day fetch (shorthand for --from D --to D)
+python monitor.py cs.GR --date 2026-03-15
+
+# Date-range fetch
 python monitor.py cs.GR --from 2026-01-01 --to 2026-03-15 -o papers.json
 
-# Filter papers by topic keywords
-python filter.py papers.json --topics topics.json -o filtered.json
-python filter.py papers.json  # uses topics.json in cwd by default
+# Running monitor against an existing output file does an incremental fetch:
+# known IDs are skipped and the fetcher paginates until --max new papers
+# are collected (or arXiv is exhausted).
 
-# Analyze a PDF (text extraction, sections, keywords)
-python analyze.py paper.pdf -o output.json
-python analyze.py paper.pdf --debug-text
+# --- llm.py -------------------------------------------------------------------
 
-# Check if a specific paper is cited
-python analyze.py paper.pdf --check-cite "Paper Title" --check-author "Smith"
+# Check the Ollama service is reachable (no --model needed)
+python llm.py
 
-# Check multiple papers from a JSON list
-python analyze.py paper.pdf --check-cited papers.json
+# List currently loaded models
+python llm.py --loaded
 
-# Extract all references with importance scores
-python analyze.py paper.pdf --refs
-python analyze.py paper.pdf --refs --top 10
-python analyze.py paper.pdf --refs -o refs.json
+# Load a model into VRAM with a keep-alive
+python llm.py --model gemma3:4b --load --keep-alive 30m
 
-# Start the local web UI
-python app.py  # opens at http://localhost:5000
+# Evict a model from VRAM
+python llm.py --model gemma3:4b --unload
+
+# One-shot generate
+python llm.py --model gemma3:4b --prompt "hello"
+python llm.py --model gemma3:4b --prompt "classify this" --system "You are a classifier" --format json
+
+# --- filter.py ----------------------------------------------------------------
+
+# Filter papers against topics.json using a local LLM
+python filter.py papers.json --model gemma3:4b
+
+# Custom topics file, write results to JSON
+python filter.py papers.json --model gemma3:4b --topics topics.json -o filtered.json
+
+# Debug a single paper with prompt/response echo
+python filter.py papers.json --model gemma3:4b --paper 2603.11969 --verbose
+
+# Dry-run: print the prompts that would be sent, no model needed
+python filter.py papers.json --dry-run
+
+# Keep model longer / unload when done
+python filter.py papers.json --model gemma3:4b --keep-alive 1h --unload
 ```
 
 ## Dependencies
 
 ```bash
-pip install pymupdf requests flask keybert marker-pdf pypdf
+pip install requests ollama
 ```
 
-`requests` is optional for `bibextract.py` (skips OpenAlex enrichment if absent) but required for `monitor.py`. `flask` is required for `app.py`. `keybert` is required for `analyze.py` keyword extraction. `marker-pdf` is required for `analyze.py` (ML-based PDF→Markdown; pulls in PyTorch as a dependency). `pypdf` is used for PDF metadata extraction in `analyze.py`. `pymupdf` is still required for `bibextract.py`.
+- `requests` — required by `monitor.py` for the arXiv Atom API.
+- `ollama` — required by `llm.py` (and transitively by `filter.py`).
+
+The **Ollama service** must also be installed and running separately. On Windows the installer registers it as a background service listening on `http://localhost:11434`. `llm.py` never starts the service — it only connects and reports clear errors if the service or requested model isn't available. Pull models with `ollama pull <name>` (e.g. `ollama pull gemma3:4b`).
 
 ## Architecture
 
-Independent single-file modules, no shared code:
-
-### `bibextract.py` — PDF analysis
-
-`ReferenceExtractor` class:
-- **`__init__`**: opens PDF, extracts `full_text`, detects `sections` (list of header dicts), builds `section_map`
-- **`section_map`**: `Dict[str, Tuple[int, Optional[int]]]` — maps section title → (start, end) char positions in `full_text`
-- **`extract()`** → all refs parsed + importance-scored, sorted by `importance_score` desc
-- **`analyze(top_n)`** → full pipeline result: title + abstract + intro + sections + refs + top_refs
-
-Citation importance scoring (`_calculate_importance_score`) weights each citation by the section it appears in (method/results sections score higher than introduction).
-
-Module-level helpers outside the class handle OpenAlex enrichment (`lookup_google_scholar_metadata`, `enrich_references_with_scholar`).
+Three independent single-file modules. The pipeline is `monitor.py → papers.json → filter.py`, with `llm.py` injected into `filter.py` as the scoring backend.
 
 ### `monitor.py` — arXiv feed monitor
 
-- `ArxivFetcher`: hits the arXiv Atom API, parses XML into `Paper` dataclasses
-- `LiteratureMonitor`: orchestrates multiple sources, deduplicates by arXiv ID, sorts by date
-- Sources can be bare category names (`cs.GR`) or full listing URLs
-- Date range filtering via `--from` / `--to` (YYYY-MM-DD); passed down to `ArxivFetcher._build_query()`
+- `Paper` dataclass (`monitor.py:46`) — `id`, `title`, `authors`, `abstract`, `url`, `pdf_url`, `published`, `categories`, `source`, `fetched_at`.
+- `ArxivFetcher` (`monitor.py:65`) — hits `https://export.arxiv.org/api/query`, parses the Atom XML into `Paper`s. `fetch()` paginates: when `known_ids` is supplied it keeps requesting batches until `target_new` unseen papers are collected (or arXiv is exhausted).
+- `LiteratureMonitor` (`monitor.py:233`) — orchestrates one or more sources, dedupes by arXiv ID, sorts newest-first. Static `save()`, `load()`, and `load_ids()` helpers persist/read the JSON file.
+- Source strings can be bare categories (`cs.GR`) or full listing URLs (`https://arxiv.org/list/cs.GR/recent`); `_resolve_category()` normalizes both.
+- Date filtering: `--date D` is sugar for `--from D --to D`; dates are pushed into `_build_query()` as a `submittedDate:[lo TO hi]` clause.
+- Incremental fetch: when the output file already exists, its IDs are loaded as `known_ids` and pagination skips past them so you get up to `--max` *new* papers per run.
+
+### `llm.py` — Ollama wrapper
+
+Thin abstraction over the official `ollama` Python package. Never starts the service — only connects.
+
+`LLMClient(model, host)` (`llm.py:76`) validates at construction time that the service is reachable and the model is pulled — raises `RuntimeError` otherwise.
+
+- `check_loaded()` → `(bool, message)` — whether the model is resident in VRAM, with reported size and expiry.
+- `load(keep_alive)` → loads the model into VRAM via an empty-prompt `generate` call. `keep_alive` follows Ollama's format: `"30m"`, `"1h"`, `"-1"` to keep forever, `"0"` to unload immediately.
+- `unload()` → calls `generate` with `keep_alive=0` to evict.
+- `generate(prompt, system, format, options)` → one-shot generation. **Does not auto-load**; raises if the model isn't already resident. `format="json"` forces structured JSON output (used by `FastFilter`).
+- `embed(text)` → embedding vector for `text` using the current model (the model must support embeddings).
+
+Cross-version compatibility with the `ollama` package is handled by small helpers at the top of the file: `_iter_models()`, `_entry_attr()`, `_model_names()` normalize dict-shaped vs object-shaped responses; `_is_not_found()` detects "model not pulled" errors uniformly.
+
+CLI mirrors the API with mutually exclusive actions: `--loaded` / `--load` / `--unload` / `--prompt`.
 
 ### `filter.py` — topic-based paper filter
 
-- `Topic` dataclass: `name`, `keywords`, `description`, `papers`
-- `TopicFilter.run(papers)` → `Dict[topic_name, [paper_with_matched_keywords]]`
-- Keyword matching: substring search in `title + abstract` (case-insensitive)
-- Papers matching zero topics are excluded; papers can appear under multiple topics
-- Config: `topics.json` in project root (forward-compatible schema with `description` + `papers` for future Claude AI scoring)
+Reads a `papers.json` (produced by `monitor.py`) and a `topics.json`, and for each `(topic, paper)` pair asks a local LLM via `LLMClient.generate(..., format="json")` to classify relevance.
 
-### `analyze.py` — PDF text extraction, sections, keywords, citation checking
+- `Topic` dataclass (`filter.py:54`) — `name`, `keywords`, `description`, `papers` (the last is reserved for future "known good" seeding).
+- `FastFilter` (`filter.py:151`):
+  - Loads `prompts/fast.prompt` once via `_load_prompts()` (`filter.py:27`) — a section-tagged plain-text file with `[system]` and `[user]` headers; missing sections raise `ValueError`.
+  - `build_prompt(topic, paper)` — fills the user template with `{topic_name}`, `{description}`, `{keywords}`, `{title}`, `{abstract}`.
+  - `parse_response(raw)` — strips markdown fences, parses JSON, normalizes `verdict` to one of `match` / `maybe` / `no` / `error`.
+  - `score(topic, paper)` — **always** returns an enriched paper dict with `match_level` ∈ {match, maybe, no, error}. Filtering is the caller's job, not `score`'s.
+  - `run(topics, papers)` — drives the pair loop, keeps only `match` / `maybe` results, and sorts `match` before `maybe`.
+- Module-level I/O helpers: `load_papers`, `load_topics`, `save_results`, `format_results`.
+- CLI knobs of note: `--dry-run` prints prompts without contacting Ollama (no `--model` required); `--paper ID` runs against a single paper for debugging; `--verbose` echoes prompts and raw responses; `--unload` evicts the model after the run.
 
-Uses `marker-pdf` (ML-based PDF→Markdown converter) for layout-aware text extraction — handles multi-column, tables, equations, headers/footers automatically. Uses `pypdf` for metadata extraction.
+### `prompts/` directory
 
-`PaperAnalyzer` class:
-- **`__init__`**: runs marker-pdf conversion, strips markdown to plain text, detects sections, builds `section_map`. Accepts optional `model_dict` to share pre-loaded marker models across calls.
-- **`section_map`**: `Dict[str, Tuple[int, Optional[int]]]` — maps section title → (start, end) char positions in `full_text`
-- **`extract_title()`** → pypdf metadata first, then first markdown heading
-- **`extract_keywords(top_n)`** → KeyBERT keyword extraction from introduction/abstract
-- **`is_cited(papers)`** → checks if papers are cited: finds each paper in references, extracts citation key (bracket `[1]`/`[WAF23]` or author name), then searches all sections for that key
-- **`extract_references(top_n)`** → extracts all references as structured data (tag, authors, title, year), enriches with citation locations and importance scores (section-weighted), sorted by importance descending
-- **`summary()`** → title + keywords + sections overview
-- **`close()`** → no-op for backward compat
+`prompts/fast.prompt` holds the FastFilter prompt in a single section-tagged file:
 
-Module-level `get_model_dict()` caches marker models for reuse across multiple PDFs.
+```
+[system]
+...system prompt...
 
-### `app.py` — local web UI
+[user]
+...user template with {topic_name}, {description}, {keywords}, {title}, {abstract} placeholders...
+```
 
-- Flask server with 5 routes: `GET /`, `GET/POST /api/topics`, `DELETE /api/topics/<name>`, `POST /api/fetch`
-- Imports `LiteratureMonitor` from `monitor` and `TopicFilter`, `load_topics` from `filter`
-- Single-page UI in `templates/index.html`: Topics tab (add/remove) + Papers tab (fetch + filter by date range)
-- `topics.json` is read/written at project root
+Parsing rule: a section header is any line whose stripped form is exactly `[system]` or `[user]`. Everything between two headers (or from a header to end-of-file) is that section's body, with surrounding whitespace stripped. Bodies can contain quotes, curly braces, and blank lines safely.
 
-## Planned
-
-- Claude API integration: summarize papers from abstract + introduction
+Add additional prompt files alongside `fast.prompt` (e.g. a future `deep.prompt`) and load them with `_load_prompts("deep.prompt")`.

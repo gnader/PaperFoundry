@@ -24,12 +24,26 @@ from typing import Dict, List, Optional
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
-def _load_prompt(name: str, prompts_dir: Path = None) -> str:
-    """Load a prompt template from the prompts directory."""
+def _load_prompts(name: str, prompts_dir: Path = None) -> dict:
+    """Load a prompts file with [system] and [user] section headers."""
     path = (prompts_dir or PROMPTS_DIR) / name
     if not path.is_file():
         raise FileNotFoundError(f"Prompt file not found: {path}")
-    return path.read_text(encoding="utf-8").strip()
+
+    sections: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped in ("[system]", "[user]"):
+            current = stripped[1:-1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+
+    for key in ("system", "user"):
+        if key not in sections:
+            raise ValueError(f"Prompt file {path} missing [{key}] section")
+    return {k: "\n".join(v).strip() for k, v in sections.items()}
 
 
 # ===========================================================================================================================
@@ -146,8 +160,9 @@ class FastFilter:
     def __init__(self, llm, verbose: bool = False, prompts_dir: Path = None):
         self.llm = llm
         self.verbose = verbose
-        self.system_prompt = _load_prompt("fast_system.txt", prompts_dir)
-        self.user_template = _load_prompt("fast_user.txt", prompts_dir)
+        prompts = _load_prompts("fast.prompt", prompts_dir)
+        self.system_prompt = prompts["system"]
+        self.user_template = prompts["user"]
 
     def build_prompt(self, topic: Topic, paper: dict) -> str:
         """Build the user prompt for a single (topic, paper) pair."""
@@ -186,7 +201,10 @@ class FastFilter:
         return {"verdict": verdict, "reason": reason}
 
     def score(self, topic: Topic, paper: dict) -> dict:
-        """Score a single paper against a single topic. Returns an enriched paper dict (or None if no match)."""
+        """Score a single paper against a single topic. Returns an enriched paper dict.
+
+        `match_level` is one of: "match", "maybe", "no", "error".
+        """
         prompt = self.build_prompt(topic, paper)
 
         if self.verbose:
@@ -201,17 +219,15 @@ class FastFilter:
 
         result = self.parse_response(raw)
 
-        if result["verdict"] in ("match", "maybe"):
-            return {
-                "id": paper.get("id", ""),
-                "title": paper.get("title", ""),
-                "authors": paper.get("authors", []),
-                "published": paper.get("published", ""),
-                "url": paper.get("url", ""),
-                "match_level": result["verdict"],
-                "reason": result["reason"],
-            }
-        return None
+        return {
+            "id": paper.get("id", ""),
+            "title": paper.get("title", ""),
+            "authors": paper.get("authors", []),
+            "published": paper.get("published", ""),
+            "url": paper.get("url", ""),
+            "match_level": result["verdict"],
+            "reason": result["reason"],
+        }
 
     def run(self, topics: List[Topic], papers: List[dict]) -> Dict[str, List[dict]]:
         """Score all papers against all topics. Returns {topic_name: [matched_papers]}."""
@@ -222,9 +238,9 @@ class FastFilter:
             for i, paper in enumerate(papers):
                 pid = paper.get("id", "?")
                 print(f"  [{topic.name}] Scoring paper {i + 1}/{len(papers)}: {pid}", end="\r")
-                result = self.score(topic, paper)
-                if result is not None:
-                    matched.append(result)
+                scored = self.score(topic, paper)
+                if scored["match_level"] in ("match", "maybe"):
+                    matched.append(scored)
             print(f"  [{topic.name}] Done — {len(matched)} matched out of {len(papers)} papers" + " " * 30)
 
             if matched:
