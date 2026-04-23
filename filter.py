@@ -1,7 +1,7 @@
 """Topic-based paper filter using a local LLM.
 
-Reads a papers.json file (produced by monitor.py) and a topics.json config, then uses a local LLM
-(via LLMClient / Ollama) to judge whether each paper is relevant to each topic.
+Reads a papers.json file (produced by monitor.py) and a topics/ directory of markdown files, then
+uses a local LLM (via LLMClient / Ollama) to judge whether each paper is relevant to each topic.
 
 Two modes (planned):
   fast — LLM reads title + abstract, returns verdict + confidence + reasoning (this file)
@@ -9,17 +9,18 @@ Two modes (planned):
 
 Usage:
     python filter.py papers.json --model gemma4:e2b
-    python filter.py papers.json --model gemma4:e2b --topics topics.json -o filtered.json
+    python filter.py papers.json --model gemma4:e2b --topics topics/ -o filtered.json
     python filter.py papers.json --model gemma4:e2b --paper 2603.11969 --verbose
 """
 
 import argparse
 import json
 import re
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from topics import Topic, load_topics
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -47,19 +48,6 @@ def _load_prompts(name: str, prompts_dir: Path = None) -> dict:
 
 
 # ===========================================================================================================================
-# Data model
-# ===========================================================================================================================
-
-
-@dataclass
-class Topic:
-    name: str
-    keywords: List[str]
-    description: str = ""
-    papers: List[dict] = field(default_factory=list)
-
-
-# ===========================================================================================================================
 # I/O helpers
 # ===========================================================================================================================
 
@@ -72,31 +60,6 @@ def load_papers(path: str) -> List[dict]:
     if not papers:
         raise ValueError(f"No papers found in {path!r}")
     return papers
-
-
-def load_topics(path: str) -> List[Topic]:
-    """Load and validate topics from a topics.json config file."""
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    topics = []
-    for t in data.get("topics", []):
-        name = t.get("name", "").strip()
-        if not name:
-            raise ValueError("Topic entry is missing a 'name' field")
-        keywords = t.get("keywords", [])
-        if not isinstance(keywords, list):
-            raise ValueError(f"Topic '{name}': 'keywords' must be a list")
-        topics.append(
-            Topic(
-                name=name,
-                keywords=[str(k) for k in keywords],
-                description=t.get("description", ""),
-                papers=t.get("papers", []),
-            )
-        )
-    if not topics:
-        raise ValueError(f"No topics found in {path!r}")
-    return topics
 
 
 def save_results(results: Dict[str, List[dict]], source_file: str, topics_file: str, path: str) -> None:
@@ -262,12 +225,12 @@ def main() -> None:
         epilog="""
 Examples:
   python filter.py papers.json --model gemma4:e2b
-  python filter.py papers.json --model gemma4:e2b --topics topics.json -o filtered.json
+  python filter.py papers.json --model gemma4:e2b --topics topics/ -o filtered.json
   python filter.py papers.json --model gemma4:e2b --paper 2603.11969 --verbose
     """,
     )
     parser.add_argument("papers", help="Path to papers.json produced by monitor.py.")
-    parser.add_argument("--topics", default="topics.json", metavar="FILE", help="Path to topics.json config (default: topics.json).")
+    parser.add_argument("--topics", default="topics", metavar="PATH", help="Path to topics directory, or a single .md topic file (default: topics/).")
     parser.add_argument("-o", "--output", metavar="FILE", help="Write filtered results to this JSON file.")
     parser.add_argument("--model", help="Ollama model name (e.g. gemma4:e2b). Not required with --dry-run.")
     parser.add_argument("--host", default="http://localhost:11434", help="Ollama host (default: http://localhost:11434).")

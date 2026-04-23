@@ -46,11 +46,11 @@ python llm.py --model gemma3:4b --prompt "classify this" --system "You are a cla
 
 # --- filter.py ----------------------------------------------------------------
 
-# Filter papers against topics.json using a local LLM
+# Filter papers against topics/*.md using a local LLM
 python filter.py papers.json --model gemma3:4b
 
-# Custom topics file, write results to JSON
-python filter.py papers.json --model gemma3:4b --topics topics.json -o filtered.json
+# Custom topics path (directory or single .md), write results to JSON
+python filter.py papers.json --model gemma3:4b --topics topics/ -o filtered.json
 
 # Debug a single paper with prompt/response echo
 python filter.py papers.json --model gemma3:4b --paper 2603.11969 --verbose
@@ -75,7 +75,7 @@ The **Ollama service** must also be installed and running separately. On Windows
 
 ## Architecture
 
-Three independent single-file modules. The pipeline is `monitor.py → papers.json → filter.py`, with `llm.py` injected into `filter.py` as the scoring backend.
+Three independent single-file modules. The pipeline is `monitor.py → papers.json → filter.py`, with `llm.py` injected into `filter.py` as the scoring backend. Topics for `filter.py` live as per-topic markdown files under `topics/`.
 
 ### `monitor.py` — arXiv feed monitor
 
@@ -102,11 +102,18 @@ Cross-version compatibility with the `ollama` package is handled by small helper
 
 CLI mirrors the API with mutually exclusive actions: `--loaded` / `--load` / `--unload` / `--prompt`.
 
+### `topics.py` — topic definitions and markdown loader
+
+Holds the `Topic` dataclass (`name`, `keywords`, `description`, `papers` — the last is a list of freeform strings, reserved for future "known good" seeding) and the markdown topic-file parser.
+
+Topic files live under `topics/` (one `.md` per topic) with a single `# Title` heading and `## Description` / `## Keywords` / `## Papers` sections. Keywords and Papers are bullet lists (`-` or `*`); Description is free-form prose. `_parse_topic_md()` implements the parsing rules; `load_topics(path)` accepts either a directory (loads all `*.md`, sorted by filename) or a single `.md` file. Missing `# Title` raises `ValueError`.
+
+Shared with `filter.py` today and with the planned `DeepFilter` tomorrow.
+
 ### `filter.py` — topic-based paper filter
 
-Reads a `papers.json` (produced by `monitor.py`) and a `topics.json`, and for each `(topic, paper)` pair asks a local LLM via `LLMClient.generate(..., format="json")` to classify relevance.
+Reads a `papers.json` (produced by `monitor.py`) and a directory of `topics/*.md` files (via `topics.load_topics`), and for each `(topic, paper)` pair asks a local LLM via `LLMClient.generate(..., format="json")` to classify relevance.
 
-- `Topic` dataclass (`filter.py:54`) — `name`, `keywords`, `description`, `papers` (the last is reserved for future "known good" seeding).
 - `FastFilter` (`filter.py:151`):
   - Loads `prompts/fast.prompt` once via `_load_prompts()` (`filter.py:27`) — a section-tagged plain-text file with `[system]` and `[user]` headers; missing sections raise `ValueError`.
   - `build_prompt(topic, paper)` — fills the user template with `{topic_name}`, `{description}`, `{keywords}`, `{title}`, `{abstract}`.
