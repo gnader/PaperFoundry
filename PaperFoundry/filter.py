@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from topics import Topic, load_topics
+from .topics import Topic, load_topics
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -275,7 +275,7 @@ Examples:
     print(f"Loaded {len(papers)} paper(s), {len(topics)} topic(s). Model: {args.model}")
 
     # Set up LLM
-    from llm import LLMClient
+    from .llm import LLMClient
 
     client = LLMClient(model=args.model, host=args.host)
     ok, msg = client.load(keep_alive=args.keep_alive)
