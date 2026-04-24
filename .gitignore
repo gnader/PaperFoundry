@@ -1,3 +1,7 @@
 __pycache__/
 test/
 tmp/
+*.egg*/
+.vscode/
+.claude/
+.papertrack*/

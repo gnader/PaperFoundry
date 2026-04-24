@@ -4,63 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+`papertrack` is the only user-facing CLI. It's registered as a console_script via `pip install -e .` and is equivalent to `python -m PaperFoundry`.
+
 ```bash
-# --- PaperFoundry.monitor -----------------------------------------------------
+# List topics (no model needed)
+papertrack --topic-list
 
-# Fetch recent papers from an arXiv category (writes/updates papers.json)
-python -m PaperFoundry.monitor cs.GR
+# Fetch + classify + write Markdown report
+papertrack --arxiv cs.GR --date today
+papertrack --arxiv cs.GR cs.CV --date this-week --topic "Neural BRDF"
+papertrack --arxiv cs.GR --from 2026-01-01 --to 2026-01-31 --all-papers -o jan.md
 
-# Multiple categories, custom output, higher per-source cap
-python -m PaperFoundry.monitor cs.GR cs.CV cs.LG -o papers.json --max 100
-
-# Fetch from a listing URL instead of a bare category
-python -m PaperFoundry.monitor https://arxiv.org/list/cs.GR/recent
-
-# Single-day fetch (shorthand for --from D --to D)
-python -m PaperFoundry.monitor cs.GR --date 2026-03-15
-
-# Date-range fetch
-python -m PaperFoundry.monitor cs.GR --from 2026-01-01 --to 2026-03-15 -o papers.json
-
-# Running monitor against an existing output file does an incremental fetch:
-# known IDs are skipped and the fetcher paginates until --max new papers
-# are collected (or arXiv is exhausted).
-
-# --- PaperFoundry.llm ---------------------------------------------------------
-
-# Check the Ollama service is reachable (no --model needed)
-python -m PaperFoundry.llm
-
-# List currently loaded models
-python -m PaperFoundry.llm --loaded
-
-# Load a model into VRAM with a keep-alive
-python -m PaperFoundry.llm --model gemma3:4b --load --keep-alive 30m
-
-# Evict a model from VRAM
-python -m PaperFoundry.llm --model gemma3:4b --unload
-
-# One-shot generate
-python -m PaperFoundry.llm --model gemma3:4b --prompt "hello"
-python -m PaperFoundry.llm --model gemma3:4b --prompt "classify this" --system "You are a classifier" --format json
-
-# --- PaperFoundry.filter ------------------------------------------------------
-
-# Filter papers against topics/*.md using a local LLM
-python -m PaperFoundry.filter papers.json --model gemma3:4b
-
-# Custom topics path (directory or single .md), write results to JSON
-python -m PaperFoundry.filter papers.json --model gemma3:4b --topics topics/ -o filtered.json
-
-# Debug a single paper with prompt/response echo
-python -m PaperFoundry.filter papers.json --model gemma3:4b --paper 2603.11969 --verbose
-
-# Dry-run: print the prompts that would be sent, no model needed
-python -m PaperFoundry.filter papers.json --dry-run
-
-# Keep model longer / unload when done
-python -m PaperFoundry.filter papers.json --model gemma3:4b --keep-alive 1h --unload
+# Equivalent entry point
+python -m PaperFoundry --arxiv cs.GR --date today
 ```
+
+The per-module debug CLIs (`python -m PaperFoundry.monitor`, `.llm`, `.filter`) still exist and are useful for isolated troubleshooting — see each module's `main()` for flags — but day-to-day usage is the single `papertrack` command.
 
 ## Using PaperFoundry as a library
 
@@ -73,7 +32,11 @@ The package re-exports its primary public API at the top level via lazy attribut
 
 ## Dependencies
 
+Python 3.11+ is required (TOML config is read via stdlib `tomllib`).
+
 ```bash
+pip install -e .          # registers the `papertrack` console_script
+# or, without install:
 pip install requests ollama
 ```
 
@@ -84,7 +47,7 @@ The **Ollama service** must also be installed and running separately. On Windows
 
 ## Architecture
 
-Four library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `filter`. The pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected into `filter` as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. User-facing content lives outside the package: `topics/*.md` (topic definitions), `papers_*.json` (fetched papers), and `config.yaml`.
+Five library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `filter`, `cli`. The pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected into `filter` as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. `cli` (exposed as the `papertrack` console_script and `python -m PaperFoundry`) is a thin orchestrator that wires fetch → filter → Markdown report. User-facing content lives outside the package: `topics/*.md` (topic definitions), `papertrack.toml` (config), `.papertrack_cache/*.json` (per-category fetch cache).
 
 ### `PaperFoundry/monitor.py` — arXiv feed monitor
 
@@ -92,7 +55,7 @@ Four library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topi
 - `ArxivFetcher` (`PaperFoundry/monitor.py:65`) — hits `https://export.arxiv.org/api/query`, parses the Atom XML into `Paper`s. `fetch()` paginates: when `known_ids` is supplied it keeps requesting batches until `target_new` unseen papers are collected (or arXiv is exhausted).
 - `LiteratureMonitor` (`PaperFoundry/monitor.py:233`) — orchestrates one or more sources, dedupes by arXiv ID, sorts newest-first. Static `save()`, `load()`, and `load_ids()` helpers persist/read the JSON file.
 - Source strings can be bare categories (`cs.GR`) or full listing URLs (`https://arxiv.org/list/cs.GR/recent`); `_resolve_category()` normalizes both.
-- Date filtering: `--date D` is sugar for `--from D --to D`; dates are pushed into `_build_query()` as a `submittedDate:[lo TO hi]` clause.
+- Date filtering: `--date D` is sugar for `--from D --to D`; dates are pushed into `_build_query()` as a `submittedDate:[YYYYMMDD0000 TO YYYYMMDD2359]` clause. The `0000`/`2359` time suffixes are required — arXiv treats bare `YYYYMMDD` as midnight, so same-day ranges would otherwise be zero-width.
 - Incremental fetch: when the output file already exists, its IDs are loaded as `known_ids` and pagination skips past them so you get up to `--max` *new* papers per run.
 
 ### `PaperFoundry/llm.py` — Ollama wrapper
@@ -131,6 +94,21 @@ Reads a `papers.json` (produced by `PaperFoundry.monitor`) and a directory of `t
   - `run(topics, papers)` — drives the pair loop, keeps only `match` / `maybe` results, and sorts `match` before `maybe`.
 - Module-level I/O helpers: `load_papers`, `save_results`, `format_results` (topic loading is re-exported from `.topics`).
 - CLI knobs of note: `--dry-run` prints prompts without contacting Ollama (no `--model` required); `--paper ID` runs against a single paper for debugging; `--verbose` echoes prompts and raw responses; `--unload` evicts the model after the run.
+
+### `PaperFoundry/cli.py` — `papertrack` unified CLI
+
+Thin orchestration layer. Loads config (`tomllib`, stdlib), resolves date range, fetches via `LiteratureMonitor` with a per-category JSON cache, scores every (topic, paper) pair via `FastFilter.score` directly (not `.run()` — that drops `match_level == "no"`, which `--all-papers` needs), then writes a Markdown report grouped per topic with buckets `✓ Match` / `? Maybe` / `✗ No`.
+
+Key functions: `load_config()`, `resolve_date_range()` (calendar-aligned: `today` / `this-week` = Monday→today / `this-month` = 1st→today), `fetch_with_cache()`, `score_all()`, `write_markdown()`. Cache files live at `<cache_dir>/<category>.json` and reuse `LiteratureMonitor.save/load` plus the existing `known_ids` incremental flow.
+
+Config search order: `--config PATH` → `./papertrack.toml` → `~/.papertrack/config.toml`. Recognized keys: `model`, `topics`, `host`, `keep_alive`, `cache_dir`, `output_dir`. CLI flags always override config. The model is always unloaded from VRAM before the CLI exits (including on exceptions and Ctrl-C), via a `try/finally` around the scoring/report phase.
+
+Default report filename: `report_<YYYY-MM-DD>_<sources_joined>.md` in `output_dir` (or CWD). Override with `-o`. `python -m PaperFoundry` is wired to `cli.main` via `__main__.py`.
+
+Other behavioral notes:
+- `--max` defaults to 200 new papers per source.
+- The Markdown report emits Title / Authors / Published / arXiv ID / Why only — abstracts are intentionally omitted to keep reports readable.
+- If `--date today` returns zero papers, `main()` prints a note about arXiv's daily announcement schedule (~20:00 UTC weekdays, none on weekends) before exiting.
 
 ### `PaperFoundry/prompts/` directory
 

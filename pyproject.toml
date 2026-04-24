@@ -1,0 +1,22 @@
+[project]
+name = "PaperFoundry"
+version = "0.2.0"
+description = "Local arXiv paper triage with topic-based filtering."
+requires-python = ">=3.11"
+dependencies = [
+    "requests",
+    "ollama",
+]
+
+[project.scripts]
+papertrack = "PaperFoundry.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["PaperFoundry*"]
+
+[tool.setuptools.package-data]
+PaperFoundry = ["prompts/*.prompt"]

@@ -1,0 +1,3 @@
+model = "gemma4:e2b"
+topics = "topics"
+cache_dir = ".papertrack_cache"

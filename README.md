@@ -1,37 +1,44 @@
 # PaperFoundry
 
-Local arXiv paper triage. Fetch recent papers from arXiv categories, then classify them against your own research topics using a locally-hosted LLM via [Ollama](https://ollama.com).
-
-Pipeline:
-
-```
-PaperFoundry.monitor  →  papers.json  →  PaperFoundry.filter  →  filtered.json
-                                              ↑
-                          PaperFoundry.topics (topics/*.md)
-                          PaperFoundry.llm    (Ollama backend)
-```
+Local arXiv paper triage. Fetch recent papers from arXiv categories, classify them against your own research topics using a locally-hosted LLM via [Ollama](https://ollama.com), and get a Markdown report — all from one CLI: `papertrack`.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.11+
 - [Ollama](https://ollama.com) installed and running on `localhost:11434`
 - At least one model pulled (e.g. `ollama pull gemma3:4b`)
 
 ```bash
-pip install requests ollama
+pip install -e .          # registers the `papertrack` command
 ```
+
+Editable install — code edits take effect immediately, no reinstall needed. `python -m PaperFoundry` works as an equivalent entry point.
 
 ## Quick start
 
-**1. Fetch recent papers from an arXiv category**
-
 ```bash
-python -m PaperFoundry.monitor cs.GR -o papers.json --max 50
+# list topics
+papertrack --topic-list
+
+# today's papers in cs.GR, classified against every topic
+papertrack --arxiv cs.GR --date today
+
+# this week, two categories, narrow to one topic
+papertrack --arxiv cs.GR cs.CV --date this-week --topic "Neural BRDF"
+
+# explicit window, include non-matched papers in the report
+papertrack --arxiv cs.GR --from 2026-01-01 --to 2026-01-31 --all-papers
 ```
 
-Re-running against the same `papers.json` does an incremental fetch — known IDs are skipped until `--max` new papers are collected.
+Date presets are calendar-aligned: `today` → today only; `this-week` → Monday-of-this-week → today; `this-month` → 1st-of-month → today. Or pass `--from`/`--to` directly.
 
-**2. Define your topics**
+`papertrack` keeps a per-category JSON cache (default `.papertrack_cache/`) so reruns only fetch *new* papers from arXiv. Bypass it with `--no-cache`.
+
+The report is written to `report_<DATE>_<sources>.md` in CWD by default; override with `-o`. Within each topic section, papers are grouped `✓ Match` → `? Maybe` → (`✗ No` only when `--all-papers` is set), newest-published first inside each bucket.
+
+The model is loaded once at the start of the run and always unloaded from VRAM before exit (even on Ctrl-C or errors).
+
+### Topics
 
 Create one markdown file per topic under `topics/`:
 
@@ -53,70 +60,56 @@ the bidirectional reflectance distribution function (BRDF)...
 
 The `# Title` is required. `## Description` is free-form prose; `## Keywords` and `## Papers` are bullet lists.
 
-**3. Filter papers against your topics**
+### Config file
 
-```bash
-python -m PaperFoundry.filter papers.json --model gemma3:4b -o filtered.json
+Create `papertrack.toml` in the working directory (or `~/.papertrack/config.toml`) so you don't have to retype `--model` and `--topics`:
+
+```toml
+model = "gemma3:4b"
+topics = "topics"                 # dir or single .md
+host = "http://localhost:11434"   # optional
+keep_alive = "30m"                # optional
+cache_dir = ".papertrack_cache"   # optional
+output_dir = "."                  # optional
 ```
 
-The LLM reads each paper's title + abstract and returns `match` / `maybe` / `no` with a one-sentence reason. Only `match`/`maybe` results are kept.
+CLI flags always override config values. Override the lookup with `--config PATH`.
 
-Preview the prompts without touching Ollama:
+### All flags
 
-```bash
-python -m PaperFoundry.filter papers.json --dry-run
-```
-
-## Using PaperFoundry as a library
-
-```python
-from PaperFoundry import LiteratureMonitor, LLMClient, FastFilter, load_topics, load_papers
-
-# Fetch
-monitor = LiteratureMonitor(["cs.GR"], max_per_source=50)
-monitor.fetch()
-monitor.save("papers.json")
-
-# Filter
-papers = load_papers("papers.json")
-topics = load_topics("topics")
-
-client = LLMClient(model="gemma3:4b")
-client.load(keep_alive="30m")
-
-results = FastFilter(llm=client).run(topics, papers)
-```
-
-Top-level exports: `LLMClient`, `Paper`, `ArxivFetcher`, `LiteratureMonitor`, `Topic`, `load_topics`, `FastFilter`, `load_papers`, `save_results`, `format_results`. Submodules are lazy-loaded, so `from PaperFoundry.llm import LLMClient` also works without pre-loading the rest of the package.
+| Flag | Purpose |
+|---|---|
+| `--arxiv CAT [CAT ...]` | arXiv categories or listing URLs (required unless `--topic-list`) |
+| `--date {today,this-week,this-month}` | Calendar-aligned date preset |
+| `--from YYYY-MM-DD`, `--to YYYY-MM-DD` | Explicit date window (mutually exclusive with `--date`) |
+| `--topic NAME` | Single topic by exact name (case-insensitive). Default: `all` |
+| `--topic-list` | List available topics and exit |
+| `--all-papers` | Include non-matched papers under a `No` bucket |
+| `-o FILE` | Output Markdown path |
+| `--max N` | Max new papers to fetch per source (default: 200) |
+| `--no-cache` | Bypass the per-source JSON cache |
+| `--config PATH` | Override the config-file search path |
+| `--model`, `--topics`, `--host`, `--keep-alive` | Override config values |
 
 ## Layout
 
 ```
 PaperFoundry/           # the package
-    llm.py              # Ollama wrapper (LLMClient)
-    monitor.py          # arXiv fetcher (LiteratureMonitor, ArxivFetcher, Paper)
-    topics.py           # Topic dataclass + markdown loader
-    filter.py           # FastFilter + CLI
+    cli.py              # papertrack — unified CLI
+    __main__.py         # `python -m PaperFoundry` → cli.main
+    llm.py              # Ollama wrapper
+    monitor.py          # arXiv fetcher
+    topics.py           # topic markdown loader
+    filter.py           # LLM-backed topic filter
     prompts/
-        fast.prompt     # FastFilter system + user prompt template
+        fast.prompt     # classification prompt template
 topics/                 # your topic definitions (one .md per topic)
-papers_*.json           # fetched papers (output of monitor)
+papertrack.toml         # optional config
+.papertrack_cache/      # per-category JSON cache (managed by papertrack)
 ```
-
-## CLI reference
-
-Each module also runs as a debug CLI via `python -m PaperFoundry.<module>`:
-
-| Command | Purpose |
-|---|---|
-| `python -m PaperFoundry.monitor <category> [-o FILE] [--max N] [--date D] [--from D --to D]` | Fetch papers |
-| `python -m PaperFoundry.llm [--loaded \| --load \| --unload \| --prompt ...]` | Inspect / control Ollama models |
-| `python -m PaperFoundry.filter <papers.json> [--model M] [--topics PATH] [--paper ID] [--verbose] [--dry-run]` | Filter papers against topics |
-
-See `CLAUDE.md` for the full command catalogue and architecture notes.
 
 ## Notes
 
-- `PaperFoundry.llm` never starts the Ollama service — it only connects. If the service isn't running or the model isn't pulled, you get a clear `RuntimeError` at client construction.
-- `LLMClient.generate` does **not** auto-load the model. Call `client.load(keep_alive=...)` once, then call `generate` repeatedly.
+- arXiv announces new submissions once per weekday (~20:00 UTC, 14:00 ET cutoff) and not at all on weekends. `--date today` may legitimately return zero papers if run before the daily announcement.
 - Prompts live in `PaperFoundry/prompts/` as section-tagged (`[system]` / `[user]`) plain-text files so they can be edited without touching code.
+- `PaperFoundry.llm` never starts the Ollama service — it only connects. If the service isn't running or the model isn't pulled, you get a clear error at startup.

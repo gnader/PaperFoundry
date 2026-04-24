@@ -51,9 +51,9 @@ class Paper:
     abstract: str
     url: str
     pdf_url: str
-    published: str          # ISO 8601
+    published: str  # ISO 8601
     categories: List[str]
-    source: str             # e.g. "arxiv:cs.GR"
+    source: str  # e.g. "arxiv:cs.GR"
     fetched_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -200,27 +200,23 @@ class ArxivFetcher:
 
             published = entry.findtext("atom:published", "", ns) or ""
 
-            authors = [
-                (a.findtext("atom:name", "", ns) or "").strip()
-                for a in entry.findall("atom:author", ns)
-            ]
+            authors = [(a.findtext("atom:name", "", ns) or "").strip() for a in entry.findall("atom:author", ns)]
 
-            categories = [
-                tag.get("term", "")
-                for tag in entry.findall("atom:category", ns)
-            ]
+            categories = [tag.get("term", "") for tag in entry.findall("atom:category", ns)]
 
-            papers.append(Paper(
-                id=arxiv_id,
-                title=title,
-                authors=authors,
-                abstract=abstract,
-                url=f"https://arxiv.org/abs/{arxiv_id}",
-                pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
-                published=published,
-                categories=categories,
-                source=source_tag,
-            ))
+            papers.append(
+                Paper(
+                    id=arxiv_id,
+                    title=title,
+                    authors=authors,
+                    abstract=abstract,
+                    url=f"https://arxiv.org/abs/{arxiv_id}",
+                    pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+                    published=published,
+                    categories=categories,
+                    source=source_tag,
+                )
+            )
 
         return papers
 
@@ -255,8 +251,11 @@ class LiteratureMonitor:
         for source in sources:
             try:
                 papers = self._fetch_source(
-                    source, date_from, date_to,
-                    known_ids=known_ids, target_new=target_new,
+                    source,
+                    date_from,
+                    date_to,
+                    known_ids=known_ids,
+                    target_new=target_new,
                 )
                 for paper in papers:
                     if paper.id not in seen_ids:
@@ -273,8 +272,7 @@ class LiteratureMonitor:
         """Route a source string to the right fetcher."""
         # Currently only arXiv is supported; extend here for other sites
         if "arxiv.org" in source or re.match(r"^[a-z]+\.[A-Z]+$", source):
-            return self.arxiv.fetch(source, date_from=date_from, date_to=date_to,
-                                    known_ids=known_ids, target_new=target_new)
+            return self.arxiv.fetch(source, date_from=date_from, date_to=date_to, known_ids=known_ids, target_new=target_new)
         raise ValueError(f"Unsupported source: '{source}'. Only arXiv URLs/categories are supported.")
 
     @staticmethod
@@ -326,7 +324,8 @@ Examples:
         help="arXiv category names (e.g. cs.GR) or listing URLs.",
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         default="papers.json",
         help="Output JSON file (default: papers.json).",
     )
