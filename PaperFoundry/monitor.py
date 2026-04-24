@@ -1,17 +1,10 @@
-"""
-Scientific literature monitor.
+"""Scientific literature monitor.
 
-Fetches recent papers from configured sources (arXiv categories) and saves
-them to a JSON file. Designed to be run periodically to track new publications.
-
-Usage:
-    python monitor.py cs.GR cs.CV -o papers.json --max 50
-    python monitor.py https://arxiv.org/list/cs.GR/recent -o papers.json
+Fetches recent papers from configured sources (arXiv categories) and persists
+them to a JSON file. Used as a library by `PaperFoundry.cli` (papertrack).
 """
 
-import argparse
 import json
-import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
@@ -22,20 +15,6 @@ try:
     import requests
 except ImportError:
     raise SystemExit("requests is required: pip install requests")
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
-
-
-def _parse_date_arg(value: str) -> str:
-    """Convert YYYY-MM-DD to YYYYMMDD for arXiv query syntax."""
-    try:
-        datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Invalid date '{value}': expected YYYY-MM-DD")
-    return value.replace("-", "")
 
 
 # ============================================================================
@@ -300,109 +279,3 @@ class LiteratureMonitor:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         return {p["id"] for p in data["papers"]}
-
-
-# ============================================================================
-# CLI
-# ============================================================================
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch recent papers from arXiv categories and save to JSON.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python monitor.py cs.GR
-  python monitor.py cs.GR cs.CV cs.LG -o papers.json --max 100
-  python monitor.py https://arxiv.org/list/cs.GR/recent
-        """,
-    )
-    parser.add_argument(
-        "sources",
-        nargs="+",
-        help="arXiv category names (e.g. cs.GR) or listing URLs.",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        default="papers.json",
-        help="Output JSON file (default: papers.json).",
-    )
-    parser.add_argument(
-        "--max",
-        type=int,
-        default=50,
-        help="Max papers to fetch per source (default: 50).",
-    )
-    parser.add_argument(
-        "--date",
-        metavar="DATE",
-        type=_parse_date_arg,
-        help="Fetch papers for a single date (YYYY-MM-DD). Cannot be combined with --from/--to.",
-    )
-    parser.add_argument(
-        "--from",
-        dest="date_from",
-        metavar="DATE",
-        type=_parse_date_arg,
-        help="Only fetch papers submitted on or after this date (YYYY-MM-DD).",
-    )
-    parser.add_argument(
-        "--to",
-        dest="date_to",
-        metavar="DATE",
-        type=_parse_date_arg,
-        help="Only fetch papers submitted on or before this date (YYYY-MM-DD).",
-    )
-    args = parser.parse_args()
-
-    # --date is shorthand for --from DATE --to DATE
-    if args.date:
-        if args.date_from or args.date_to:
-            parser.error("--date cannot be combined with --from/--to")
-        args.date_from = args.date
-        args.date_to = args.date
-
-    # Load existing papers from output file if it exists
-    existing_papers: List[Paper] = []
-    known_ids: set = set()
-    if os.path.isfile(args.output):
-        try:
-            existing_papers = LiteratureMonitor.load(args.output)
-            known_ids = {p.id for p in existing_papers}
-            print(f"Loaded {len(known_ids)} existing papers from {args.output}")
-        except Exception as e:
-            print(f"  [warning] Could not load {args.output}: {e}")
-
-    monitor = LiteratureMonitor(max_results=args.max)
-    new_papers = monitor.fetch_all(
-        args.sources,
-        date_from=args.date_from,
-        date_to=args.date_to,
-        known_ids=known_ids if known_ids else None,
-        target_new=args.max,
-    )
-
-    # Merge: new papers first, then existing
-    all_papers = new_papers + existing_papers
-    all_papers.sort(key=lambda p: p.published, reverse=True)
-
-    # Print a quick summary of new papers
-    print(f"\n{'-' * 60}")
-    if known_ids:
-        print(f"Added {len(new_papers)} new papers ({len(all_papers)} total)")
-    print(f"{'Title':<55} {'Date':<12}")
-    print(f"{'-' * 60}")
-    display = new_papers if known_ids else all_papers
-    for p in display[:20]:
-        date = p.published[:10]
-        print(f"{p.title[:54]:<55} {date}")
-    if len(display) > 20:
-        print(f"  ... and {len(display) - 20} more")
-
-    monitor.save(all_papers, args.output)
-
-
-if __name__ == "__main__":
-    main()

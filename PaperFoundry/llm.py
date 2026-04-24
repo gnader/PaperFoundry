@@ -8,8 +8,6 @@ or a requested model isn't available.
 Planned use: deep-mode paper relevance scoring in filter.py.
 """
 
-import argparse
-import sys
 from typing import List, Optional, Tuple
 
 try:
@@ -192,82 +190,3 @@ class LLMClient:
         if not embeddings or not embeddings[0]:
             raise RuntimeError(f"Model '{self.model}' returned no embeddings. It may not support embedding.")
         return embeddings[0]
-
-
-# ===========================================================================================================================
-# CLI
-# ===========================================================================================================================
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Check / control Ollama service + model state.")
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Ollama host (default: {DEFAULT_HOST}).")
-    parser.add_argument("--model", help="Model name (e.g. gemma4:e2b).")
-    parser.add_argument("--keep-alive", help='Keep-alive duration for --load (e.g. "5m", "1h", "-1"). Default: server default.')
-    parser.add_argument("--prompt", help="Run generate() with this prompt and print the response.")
-    parser.add_argument("--system", help="Optional system prompt for --prompt.")
-    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --prompt (json forces structured output).")
-
-    action = parser.add_mutually_exclusive_group()
-    action.add_argument("--loaded", action="store_true", help="Check if the model is in VRAM.")
-    action.add_argument("--load", action="store_true", help="Load the model into VRAM.")
-    action.add_argument("--unload", action="store_true", help="Evict the model from VRAM.")
-
-    args = parser.parse_args()
-
-    # No --model: just check if Ollama service is reachable
-    if not args.model:
-        if args.load or args.unload or args.prompt is not None:
-            parser.error("--load, --unload, and --prompt require --model")
-        try:
-            ollama.Client(host=args.host).list()
-        except Exception as e:
-            print(_connection_error_message(args.host, e))
-            return 1
-        if args.loaded:
-            try:
-                response = ollama.Client(host=args.host).ps()
-            except Exception as e:
-                print(_connection_error_message(args.host, e))
-                return 1
-            running = list(_iter_models(response))
-            if not running:
-                print("No models currently loaded.")
-            else:
-                names = [n for n in (_entry_attr(e, "model", "name") for e in running) if n]
-                print(f"Loaded models: {', '.join(names)}")
-        else:
-            print(f"Ollama reachable at {args.host}")
-        return 0
-
-    # --model given: construct client (validates service + model)
-    try:
-        client = LLMClient(model=args.model, host=args.host)
-    except RuntimeError as e:
-        print(str(e))
-        return 1
-
-    if args.load:
-        ok, message = client.load(keep_alive=args.keep_alive)
-    elif args.unload:
-        ok, message = client.unload()
-    elif args.prompt is not None:
-        try:
-            text = client.generate(prompt=args.prompt, system=args.system, format=args.format if args.format == "json" else None)
-        except RuntimeError as e:
-            print(str(e))
-            return 1
-        print(text)
-        return 0
-    elif args.loaded:
-        ok, message = client.check_loaded()
-    else:
-        print(f"Ollama reachable at {args.host}, model '{args.model}' available")
-        return 0
-
-    print(message)
-    return 0 if ok else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

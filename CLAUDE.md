@@ -19,16 +19,16 @@ papertrack --arxiv cs.GR --from 2026-01-01 --to 2026-01-31 --all-papers -o jan.m
 python -m PaperFoundry --arxiv cs.GR --date today
 ```
 
-The per-module debug CLIs (`python -m PaperFoundry.monitor`, `.llm`, `.filter`) still exist and are useful for isolated troubleshooting — see each module's `main()` for flags — but day-to-day usage is the single `papertrack` command.
+`papertrack` is the only entry point. Other modules (`monitor`, `llm`, `filter`) are library-only — they have no `main()` and no per-module CLI.
 
 ## Using PaperFoundry as a library
 
 ```python
 import PaperFoundry
-from PaperFoundry import LLMClient, FastFilter, load_topics, load_papers
+from PaperFoundry import LLMClient, FastFilter, load_topics, PromptLibrary
 ```
 
-The package re-exports its primary public API at the top level via lazy attribute loading (`PaperFoundry/__init__.py`): `LLMClient`, `Paper`, `ArxivFetcher`, `LiteratureMonitor`, `Topic`, `load_topics`, `FastFilter`, `load_papers`, `save_results`, `format_results`. Submodules are imported on first access, so `python -m PaperFoundry.<mod>` runs without double-import warnings.
+The package re-exports its primary public API at the top level via lazy attribute loading (`PaperFoundry/__init__.py`): `LLMClient`, `Paper`, `ArxivFetcher`, `LiteratureMonitor`, `Topic`, `load_topics`, `FastFilter`, `Prompt`, `PromptLibrary`. Submodules are imported on first access.
 
 ## Dependencies
 
@@ -47,7 +47,7 @@ The **Ollama service** must also be installed and running separately. On Windows
 
 ## Architecture
 
-Five library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `filter`, `cli`. The pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected into `filter` as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. `cli` (exposed as the `papertrack` console_script and `python -m PaperFoundry`) is a thin orchestrator that wires fetch → filter → Markdown report. User-facing content lives outside the package: `topics/*.md` (topic definitions), `papertrack.toml` (config), `.papertrack_cache/*.json` (per-category fetch cache).
+Six library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `prompt`, `filter`, `cli`. The pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected into `filter` as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. `cli` (exposed as the `papertrack` console_script and `python -m PaperFoundry`) is a thin orchestrator that wires fetch → filter → Markdown report. User-facing content lives outside the package: `topics/*.md` (topic definitions), `papertrack.toml` (config), `.papertrack_cache/*.json` (per-category fetch cache).
 
 ### `PaperFoundry/monitor.py` — arXiv feed monitor
 
@@ -72,8 +72,6 @@ Thin abstraction over the official `ollama` Python package. Never starts the ser
 
 Cross-version compatibility with the `ollama` package is handled by small helpers at the top of the file: `_iter_models()`, `_entry_attr()`, `_model_names()` normalize dict-shaped vs object-shaped responses; `_is_not_found()` detects "model not pulled" errors uniformly.
 
-CLI mirrors the API with mutually exclusive actions: `--loaded` / `--load` / `--unload` / `--prompt`.
-
 ### `PaperFoundry/topics.py` — topic definitions and markdown loader
 
 Holds the `Topic` dataclass (`name`, `keywords`, `description`, `papers` — the last is a list of freeform strings, reserved for future "known good" seeding) and the markdown topic-file parser.
@@ -86,18 +84,15 @@ Shared with `filter.py` today and with the planned `DeepFilter` tomorrow.
 
 Reads a `papers.json` (produced by `PaperFoundry.monitor`) and a directory of `topics/*.md` files (via `topics.load_topics`), and for each `(topic, paper)` pair asks a local LLM via `LLMClient.generate(..., format="json")` to classify relevance.
 
-- `FastFilter` (`PaperFoundry/filter.py:151`):
-  - Loads `prompts/fast.prompt` once via `_load_prompts()` (`PaperFoundry/filter.py:27`) — a section-tagged plain-text file with `[system]` and `[user]` headers; missing sections raise `ValueError`. `PROMPTS_DIR` resolves relative to the package directory.
-  - `build_prompt(topic, paper)` — fills the user template with `{topic_name}`, `{description}`, `{keywords}`, `{title}`, `{abstract}`.
+`FastFilter`:
+  - Loads the `fast` prompt once via `PromptLibrary(prompts_dir).load("fast")` (see `PaperFoundry/prompt.py`). The resulting `Prompt` exposes `.system_template`, `.user_template`, and a discovered `.parameters` set.
+  - `_bind(topic, paper)` — calls `self.prompt.render(...)` with the five declared parameters (`topic_name`, `description`, `keywords`, `title`, `abstract`); returns `{"system": ..., "user": ...}`.
   - `parse_response(raw)` — strips markdown fences, parses JSON, normalizes `verdict` to one of `match` / `maybe` / `no` / `error`.
-  - `score(topic, paper)` — **always** returns an enriched paper dict with `match_level` ∈ {match, maybe, no, error}. Filtering is the caller's job, not `score`'s.
-  - `run(topics, papers)` — drives the pair loop, keeps only `match` / `maybe` results, and sorts `match` before `maybe`.
-- Module-level I/O helpers: `load_papers`, `save_results`, `format_results` (topic loading is re-exported from `.topics`).
-- CLI knobs of note: `--dry-run` prints prompts without contacting Ollama (no `--model` required); `--paper ID` runs against a single paper for debugging; `--verbose` echoes prompts and raw responses; `--unload` evicts the model after the run.
+  - `score(topic, paper)` — **always** returns an enriched paper dict with `match_level` ∈ {match, maybe, no, error}. Filtering is the caller's job, not `score`'s. `cli.py`'s `score_all` is the loop driver over (topic × paper).
 
 ### `PaperFoundry/cli.py` — `papertrack` unified CLI
 
-Thin orchestration layer. Loads config (`tomllib`, stdlib), resolves date range, fetches via `LiteratureMonitor` with a per-category JSON cache, scores every (topic, paper) pair via `FastFilter.score` directly (not `.run()` — that drops `match_level == "no"`, which `--all-papers` needs), then writes a Markdown report grouped per topic with buckets `✓ Match` / `? Maybe` / `✗ No`.
+Thin orchestration layer. Loads config (`tomllib`, stdlib), resolves date range, fetches via `LiteratureMonitor` with a per-category JSON cache, scores every (topic, paper) pair via `FastFilter.score`, then writes a Markdown report grouped per topic with buckets `✓ Match` / `? Maybe` / `✗ No`.
 
 Key functions: `load_config()`, `resolve_date_range()` (calendar-aligned: `today` / `this-week` = Monday→today / `this-month` = 1st→today), `fetch_with_cache()`, `score_all()`, `write_markdown()`. Cache files live at `<cache_dir>/<category>.json` and reuse `LiteratureMonitor.save/load` plus the existing `known_ids` incremental flow.
 
@@ -110,13 +105,21 @@ Other behavioral notes:
 - The Markdown report emits Title / Authors / Published / arXiv ID / Why only — abstracts are intentionally omitted to keep reports readable.
 - If `--date today` returns zero papers, `main()` prints a note about arXiv's daily announcement schedule (~20:00 UTC weekdays, none on weekends) before exiting.
 
+### `PaperFoundry/prompt.py` — prompts as shaders
+
+A `.prompt` file is treated like a shader source: parsed (compiled) into a `Prompt` program with two section templates (`[system]` / `[user]`) and a declared parameter set discovered from the `{name}` placeholders in the body. `Prompt.render(**params)` binds parameters — validating strictly that every declared one is supplied and no extras slip in — and returns `{"system": ..., "user": ...}`.
+
+- `Prompt` (frozen dataclass): `name`, `system_template`, `user_template`, `parameters: frozenset[str]`, `source_path`. Methods: `load(name, root)`, `validate(params)`, `render(**params)`.
+- `PromptLibrary(root)`: directory registry. `load(name)` → compile `<root>/<name>.prompt`. `list()` → sorted stems of all `*.prompt` files. Default root is `PaperFoundry/prompts/`.
+- Both sections are templates (the system section can also carry placeholders). Placeholder discovery uses `string.Formatter().parse()`.
+
 ### `PaperFoundry/prompts/` directory
 
-`PaperFoundry/prompts/fast.prompt` holds the FastFilter prompt in a single section-tagged file:
+`PaperFoundry/prompts/fast.prompt` is the only prompt today:
 
 ```
 [system]
-...system prompt...
+...system prompt (may contain {placeholders} too)...
 
 [user]
 ...user template with {topic_name}, {description}, {keywords}, {title}, {abstract} placeholders...
@@ -124,4 +127,4 @@ Other behavioral notes:
 
 Parsing rule: a section header is any line whose stripped form is exactly `[system]` or `[user]`. Everything between two headers (or from a header to end-of-file) is that section's body, with surrounding whitespace stripped. Bodies can contain quotes, curly braces, and blank lines safely.
 
-Add additional prompt files alongside `fast.prompt` (e.g. a future `deep.prompt`) and load them with `_load_prompts("deep.prompt")`.
+Add additional prompt files alongside `fast.prompt` (e.g. a future `deep.prompt`) and load them with `PromptLibrary().load("deep")` or `Prompt.load("deep")`.

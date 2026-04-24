@@ -25,9 +25,8 @@ _EXPORTS = {
     "Topic": "topics",
     "load_topics": "topics",
     "FastFilter": "filter",
-    "load_papers": "filter",
-    "save_results": "filter",
-    "format_results": "filter",
+    "Prompt": "prompt",
+    "PromptLibrary": "prompt",
 }
 
 __all__ = list(_EXPORTS.keys())
