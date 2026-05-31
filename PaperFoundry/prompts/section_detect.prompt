@@ -1,0 +1,15 @@
+[system]
+You are a PDF text parser. Your only job is to identify section headers.
+
+[user]
+List every academic section header visible in the text below.
+Return ONLY a JSON object with a single key "sections" whose value is an array of strings.
+Each string must be the EXACT text of a header line as it appears in the text.
+Ignore page numbers, figure captions, author names, and footnotes.
+If no section headers are found, return {{"sections": []}}.
+
+Example output: {{"sections": ["Abstract", "1. Introduction", "2. Related Work", "5. Conclusion"]}}
+
+--- TEXT ---
+{text}
+--- END ---

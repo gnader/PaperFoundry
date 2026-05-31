@@ -19,7 +19,7 @@ papertrack --arxiv cs.GR --from 2026-01-01 --to 2026-01-31 --all-papers -o jan.m
 python -m PaperFoundry --arxiv cs.GR --date today
 ```
 
-`papertrack` is the only entry point. Other modules (`monitor`, `llm`, `filter`) are library-only — they have no `main()` and no per-module CLI.
+`papertrack` is the only user-facing entry point. `analyzer` has a `__main__` for development testing (see below). Other modules (`monitor`, `llm`, `filter`) are library-only — they have no `main()` and no per-module CLI.
 
 ## Using PaperFoundry as a library
 
@@ -28,7 +28,7 @@ import PaperFoundry
 from PaperFoundry import LLMClient, FastFilter, load_topics, PromptLibrary
 ```
 
-The package re-exports its primary public API at the top level via lazy attribute loading (`PaperFoundry/__init__.py`): `LLMClient`, `Paper`, `ArxivFetcher`, `LiteratureMonitor`, `Topic`, `load_topics`, `FastFilter`, `Prompt`, `PromptLibrary`. Submodules are imported on first access.
+The package re-exports its primary public API at the top level via lazy attribute loading (`PaperFoundry/__init__.py`): `LLMClient`, `Paper`, `ArxivFetcher`, `LiteratureMonitor`, `Topic`, `load_topics`, `FastFilter`, `PaperAnalyzer`, `Prompt`, `PromptLibrary`. Submodules are imported on first access.
 
 ## Dependencies
 
@@ -47,7 +47,7 @@ The **Ollama service** must also be installed and running separately. On Windows
 
 ## Architecture
 
-Six library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `prompt`, `filter`, `cli`. The pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected into `filter` as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. `cli` (exposed as the `papertrack` console_script and `python -m PaperFoundry`) is a thin orchestrator that wires fetch → filter → Markdown report. User-facing content lives outside the package: `topics/*.md` (topic definitions), `papertrack.toml` (config), `.papertrack_cache/*.json` (per-category fetch cache).
+Seven library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `prompt`, `filter`, `analyzer`, `cli`. The pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected into `filter` as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. `cli` (exposed as the `papertrack` console_script and `python -m PaperFoundry`) is a thin orchestrator that wires fetch → filter → Markdown report. `analyzer` is a standalone module for deep single-paper analysis (not wired into the CLI pipeline). User-facing content lives outside the package: `topics/*.md` (topic definitions), `papertrack.toml` (config), `.papertrack_cache/*.json` (per-category fetch cache).
 
 ### `PaperFoundry/monitor.py` — arXiv feed monitor
 
@@ -85,7 +85,7 @@ Shared with `filter.py` today and with the planned `DeepFilter` tomorrow.
 Reads a `papers.json` (produced by `PaperFoundry.monitor`) and a directory of `topics/*.md` files (via `topics.load_topics`), and for each `(topic, paper)` pair asks a local LLM via `LLMClient.generate(..., format="json")` to classify relevance.
 
 `FastFilter`:
-  - Loads the `fast` prompt once via `PromptLibrary(prompts_dir).load("fast")` (see `PaperFoundry/prompt.py`). The resulting `Prompt` exposes `.system_template`, `.user_template`, and a discovered `.parameters` set.
+  - Loads the `fast_filter` prompt once via `PromptLibrary(prompts_dir).load("fast_filter")` (see `PaperFoundry/prompt.py`). The resulting `Prompt` exposes `.system_template`, `.user_template`, and a discovered `.parameters` set.
   - `_bind(topic, paper)` — calls `self.prompt.render(...)` with the five declared parameters (`topic_name`, `description`, `keywords`, `title`, `abstract`); returns `{"system": ..., "user": ...}`.
   - `parse_response(raw)` — strips markdown fences, parses JSON, normalizes `verdict` to one of `match` / `maybe` / `no` / `error`.
   - `score(topic, paper)` — **always** returns an enriched paper dict with `match_level` ∈ {match, maybe, no, error}. Filtering is the caller's job, not `score`'s. `cli.py`'s `score_all` is the loop driver over (topic × paper).
@@ -113,18 +113,40 @@ A `.prompt` file is treated like a shader source: parsed (compiled) into a `Prom
 - `PromptLibrary(root)`: directory registry. `load(name)` → compile `<root>/<name>.prompt`. `list()` → sorted stems of all `*.prompt` files. Default root is `PaperFoundry/prompts/`.
 - Both sections are templates (the system section can also carry placeholders). Placeholder discovery uses `string.Formatter().parse()`.
 
+### `PaperFoundry/analyzer.py` — single-paper deep analysis
+
+Extracts text from a local PDF and produces a structured LLM analysis (`tldr`, `what_it_does`, `what_it_improves`).
+
+Two classes:
+
+**`SectionExtractor`** — two-pass section-aware text extraction:
+- Pass 1 (detection): paginates through PDF pages in chunks of `chunk_pages` (default 2). Each chunk is sent to the LLM via the `section_detect` prompt, which returns a `{"sections": [...]}` JSON object listing the exact header strings visible in that chunk.
+- Pass 2 (extraction): locates each detected header in the full concatenated text via case-insensitive `str.find`, with a word-boundary regex fallback. Builds a sorted `(offset, name)` boundary list, then slices sections in document order and concatenates them up to `max_chars`.
+- Fallback: if fewer than 2 headers are detected, falls back silently to head-truncation.
+- `verbose=True` prints each chunk's raw LLM response — useful for debugging detection failures.
+
+**`PaperAnalyzer`** — wraps `SectionExtractor` + the `analyze` prompt:
+- `extract_text(pdf_path)` — runs the two-pass extraction, returns the section-filtered text.
+- `analyze(pdf_path)` — calls `extract_text`, binds the `analyze` prompt, generates, and parses the JSON response.
+- Constructor params: `max_chars` (default 8000), `chunk_pages` (default 2).
+
+Dev test entry point:
+```bash
+python -m PaperFoundry.analyzer [pdf] [model]            # full analysis
+python -m PaperFoundry.analyzer [pdf] [model] --sections # section extractor only (shows headers, boundaries, extracted text)
+```
+PDFs are looked up in `test/*.pdf` if no path is given.
+
 ### `PaperFoundry/prompts/` directory
 
-`PaperFoundry/prompts/fast.prompt` is the only prompt today:
+Current prompts:
 
-```
-[system]
-...system prompt (may contain {placeholders} too)...
+| File | Placeholders | Used by |
+|---|---|---|
+| `fast_filter.prompt` | `topic_name`, `description`, `keywords`, `title`, `abstract` | `FastFilter` |
+| `analyze.prompt` | `text` | `PaperAnalyzer` |
+| `section_detect.prompt` | `text` | `SectionExtractor` |
 
-[user]
-...user template with {topic_name}, {description}, {keywords}, {title}, {abstract} placeholders...
-```
+Parsing rule: a section header is any line whose stripped form is exactly `[system]` or `[user]`. Everything between two headers (or from a header to end-of-file) is that section's body, with surrounding whitespace stripped. Literal `{` / `}` in prompt bodies must be escaped as `{{` / `}}` (standard `string.Formatter` convention) — necessary when the prompt body contains JSON examples.
 
-Parsing rule: a section header is any line whose stripped form is exactly `[system]` or `[user]`. Everything between two headers (or from a header to end-of-file) is that section's body, with surrounding whitespace stripped. Bodies can contain quotes, curly braces, and blank lines safely.
-
-Add additional prompt files alongside `fast.prompt` (e.g. a future `deep.prompt`) and load them with `PromptLibrary().load("deep")` or `Prompt.load("deep")`.
+Add additional prompt files and load them with `PromptLibrary().load("name")` or `Prompt.load("name")`.

@@ -26,7 +26,7 @@ class FastFilter:
     def __init__(self, llm, verbose: bool = False, prompts_dir: Path = None):
         self.llm = llm
         self.verbose = verbose
-        self.prompt = PromptLibrary(prompts_dir).load("fast")
+        self.prompt = PromptLibrary(prompts_dir).load("fast_filter")
 
     def _bind(self, topic: Topic, paper: dict) -> Dict[str, str]:
         return self.prompt.render(
