@@ -1,0 +1,17 @@
+[system]
+You are a research paper analyst. Follow the user's output format exactly.
+
+[user]
+Analyze the academic paper below. Return ONLY a JSON object with exactly these three fields — no other text, no markdown fences:
+
+{{
+  "tldr": "<one sentence capturing the core contribution>",
+  "what_it_does": "<2-3 sentences on the method or system proposed>",
+  "what_it_improves": "<2-3 sentences on the problem it solves and how it advances prior work>"
+}}
+
+--- PAPER START ---
+{text}
+--- PAPER END ---
+
+Now output the JSON object:

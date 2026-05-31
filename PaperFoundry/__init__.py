@@ -25,6 +25,7 @@ _EXPORTS = {
     "Topic": "topics",
     "load_topics": "topics",
     "FastFilter": "filter",
+    "PaperAnalyzer": "analyzer",
     "Prompt": "prompt",
     "PromptLibrary": "prompt",
 }
