@@ -2,7 +2,9 @@
 You are a research paper analyst. Follow the user's output format exactly.
 
 [user]
-Analyze the academic paper below. Return ONLY a JSON object with exactly these three fields — no other text, no markdown fences:
+Analyze the academic paper below. Focus your analysis on these sections: {key_sections}
+
+Return ONLY a JSON object with exactly these three fields — no other text, no markdown fences:
 
 {{
   "tldr": "<one sentence capturing the core contribution>",

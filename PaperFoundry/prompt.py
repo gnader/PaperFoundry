@@ -32,15 +32,20 @@ from typing import Dict, FrozenSet, List, Optional
 
 _DEFAULT_ROOT = Path(__file__).parent / "prompts"
 _SECTIONS = ("system", "user")
+_OPTIONAL_SECTIONS = ("paginate",)
+_ALL_SECTION_HEADERS = frozenset(f"[{s}]" for s in (*_SECTIONS, *_OPTIONAL_SECTIONS))
 
 
 def _parse_sections(text: str, source: Path) -> Dict[str, str]:
-    """Split a .prompt file into {section_name: body_str}. Both sections required."""
+    """Split a .prompt file into {section_name: body_str}.
+
+    Required: [system] and [user]. Optional: [paginate].
+    """
     sections: Dict[str, List[str]] = {}
     current: Optional[str] = None
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped in ("[system]", "[user]"):
+        if stripped in _ALL_SECTION_HEADERS:
             current = stripped[1:-1]
             sections[current] = []
         elif current is not None:
@@ -50,6 +55,15 @@ def _parse_sections(text: str, source: Path) -> Dict[str, str]:
         if key not in sections:
             raise ValueError(f"Prompt file {source} missing [{key}] section")
     return {k: "\n".join(v).strip() for k, v in sections.items()}
+
+
+def _parse_paginate_input(body: str) -> Optional[str]:
+    """Return the 'input' value from a [paginate] section body, or None."""
+    for line in body.splitlines():
+        key, _, val = line.strip().partition("=")
+        if key.strip() == "input" and val.strip():
+            return val.strip()
+    return None
 
 
 def _discover_params(template: str) -> FrozenSet[str]:
@@ -72,6 +86,7 @@ class Prompt:
     user_template: str
     parameters: FrozenSet[str]
     source_path: Path
+    paginate_input: Optional[str] = None
 
     @classmethod
     def load(cls, name: str, root: Optional[Path] = None) -> "Prompt":
@@ -112,12 +127,14 @@ class PromptLibrary:
             raise FileNotFoundError(f"Prompt file not found: {path}")
         sections = _parse_sections(path.read_text(encoding="utf-8"), path)
         params = _discover_params(sections["system"]) | _discover_params(sections["user"])
+        paginate_input = _parse_paginate_input(sections.get("paginate", ""))
         return Prompt(
             name=name,
             system_template=sections["system"],
             user_template=sections["user"],
             parameters=params,
             source_path=path,
+            paginate_input=paginate_input,
         )
 
     def list(self) -> List[str]:

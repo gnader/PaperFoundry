@@ -1,17 +1,20 @@
 """Paper analysis module.
 
-Extracts text from a local PDF and sends it to a local LLM (via `LLMClient` /
-Ollama) for structured analysis: TLDR, what it does, what it improves over
-prior work.
+Extracts text from a local PDF and runs it through the ``analyze_paper``
+pipeline: section detection → section classification → structured analysis.
+
+The pipeline is defined in ``pipelines/analyze_paper.toml`` at the repo root
+and executed by :class:`Pipeline`. Intermediate results are cached per-step as
+JSON files so any step can be re-run without repeating earlier work.
 
 Usage:
     from PaperFoundry import LLMClient, PaperAnalyzer
+    from pathlib import Path
 
     client = LLMClient(model="gemma4:e2b")
     client.load(keep_alive="30m")
 
-    analyzer = PaperAnalyzer(llm=client)
-    text = analyzer.extract_text("paper.pdf")
+    analyzer = PaperAnalyzer(llm=client, cache_dir=Path(".papertrack_cache"))
     result = analyzer.analyze("paper.pdf")
     # result: {"tldr": ..., "what_it_does": ..., "what_it_improves": ...}
 
@@ -22,148 +25,62 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 try:
     import pypdf
 except ImportError:
     raise ImportError("pypdf is required: pip install pypdf")
 
-from .prompt import PromptLibrary
+from .pipeline import Pipeline
 
-_DEFAULT_MAX_CHARS = 8_000
-
-
-class SectionExtractor:
-    """Detects section boundaries in PDF pages using paginated LLM calls, then
-    extracts and concatenates sections in order up to a character budget.
-
-    Pass 1 — detection: pages are fed in chunks of `chunk_pages` to the LLM
-    with the `section_detect` prompt; each call returns a JSON array of header
-    strings as they appear in the text.
-
-    Pass 2 — extraction: each header is located in the full text via
-    case-insensitive string search; text is sliced between adjacent boundaries
-    and concatenated until `max_chars` is reached.
-
-    Fallback: if fewer than 2 headers are detected, head-truncation is used.
-    """
-
-    def __init__(self, llm, chunk_pages: int = 2, prompts_dir: Optional[Path] = None, verbose: bool = False):
-        self.llm = llm
-        self.chunk_pages = chunk_pages
-        self.verbose = verbose
-        self.prompt = PromptLibrary(prompts_dir).load("section_detect")
-
-    def _parse_headers(self, raw: str) -> List[str]:
-        text = raw.strip()
-        fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
-        if fence:
-            text = fence.group(1).strip()
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return []
-        # Accept {"sections": [...]} (preferred) or bare [...]
-        if isinstance(data, dict):
-            data = data.get("sections", [])
-        if not isinstance(data, list):
-            return []
-        return [str(h).strip() for h in data if str(h).strip()]
-
-    def detect_headers(self, pages: List[str]) -> List[str]:
-        """Return all section header strings found across all page chunks, in order."""
-        seen: set = set()
-        headers: List[str] = []
-        for i in range(0, len(pages), self.chunk_pages):
-            chunk = "\n\n".join(pages[i : i + self.chunk_pages])
-            if not chunk.strip():
-                continue
-            bound = self.prompt.render(text=chunk)
-            raw = self.llm.generate(prompt=bound["user"], system=bound["system"], format="json")
-            if self.verbose:
-                page_range = f"pages {i + 1}–{min(i + self.chunk_pages, len(pages))}"
-                print(f"  [{page_range}] raw: {raw!r}")
-            for h in self._parse_headers(raw):
-                if h not in seen:
-                    seen.add(h)
-                    headers.append(h)
-        return headers
-
-    def _find_boundaries(self, full_text: str, headers: List[str]) -> List[Tuple[int, str]]:
-        """Locate each header in full_text; return sorted (offset, name) pairs."""
-        lower = full_text.lower()
-        boundaries: List[Tuple[int, str]] = []
-        for h in headers:
-            pos = lower.find(h.lower())
-            if pos == -1:
-                m = re.search(r"\b" + re.escape(h.lower()) + r"\b", lower)
-                pos = m.start() if m else -1
-            if pos != -1:
-                boundaries.append((pos, h))
-        boundaries.sort(key=lambda x: x[0])
-        return boundaries
-
-    def extract(self, pages: List[str], max_chars: int) -> str:
-        """Extract sections from pages up to max_chars. Falls back to head-truncation."""
-        full_text = "\n\n".join(pages)
-        headers = self.detect_headers(pages)
-        if len(headers) < 2:
-            return full_text[:max_chars]
-
-        boundaries = self._find_boundaries(full_text, headers)
-        if len(boundaries) < 2:
-            return full_text[:max_chars]
-
-        parts: List[str] = []
-        chars = 0
-        for i, (pos, _) in enumerate(boundaries):
-            end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(full_text)
-            section = full_text[pos:end].strip()
-            remaining = max_chars - chars
-            if len(section) >= remaining:
-                parts.append(section[:remaining])
-                break
-            parts.append(section)
-            chars += len(section)
-
-        return "\n\n".join(parts) if parts else full_text[:max_chars]
+_DEFAULT_PIPELINE = Path(__file__).parent.parent / "pipelines" / "analyze_paper.toml"
 
 
 class PaperAnalyzer:
-    """Analyzes a PDF paper using a local LLM.
+    """Analyzes a PDF paper using a local LLM via a declarative pipeline.
 
-    Uses `SectionExtractor` to detect section boundaries via paginated LLM calls,
-    then feeds the assembled sections (up to `max_chars`) to the analysis LLM.
-    Falls back to head-truncation if section detection yields fewer than 2 headers.
+    The pipeline (``analyze_paper.toml`` by default) runs three steps:
+    1. ``detect_sections`` — identify section headers in the text.
+    2. ``classify_sections`` — select which headers are most relevant.
+    3. ``analyze`` — produce tldr / what_it_does / what_it_improves.
+
+    Intermediate results are cached per-step in ``cache_dir`` so re-runs
+    skip steps whose outputs are already stored.
     """
 
     def __init__(
         self,
         llm,
         prompts_dir: Optional[Path] = None,
-        max_chars: int = _DEFAULT_MAX_CHARS,
-        chunk_pages: int = 2,
+        cache_dir: Optional[Path] = None,
+        pipeline_path: Optional[Path] = None,
+        chunk_pages: int = 2,  # kept for API compatibility; unused
+        max_chars: Optional[int] = None,  # kept for API compatibility; set on LLMClient instead
     ):
         self.llm = llm
-        self.max_chars = max_chars
-        self.section_extractor = SectionExtractor(llm, chunk_pages, prompts_dir)
-        self.prompt = PromptLibrary(prompts_dir).load("analyze")
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.pipeline = Pipeline.load(
+            pipeline_path or _DEFAULT_PIPELINE,
+            prompts_dir=prompts_dir,
+        )
 
     def extract_text(self, pdf_path: str) -> str:
-        """Extract and section-filter text from a PDF, capped at self.max_chars."""
+        """Extract the full raw text from a PDF."""
         reader = pypdf.PdfReader(pdf_path)
         pages = [page.extract_text() or "" for page in reader.pages]
-        return self.section_extractor.extract(pages, self.max_chars)
+        return "\n\n".join(pages)
 
     def parse_response(self, raw: str) -> dict:
-        """Parse the LLM's JSON response. Returns dict with tldr/what_it_does/what_it_improves."""
+        """Parse a raw LLM JSON response into the standard analysis dict.
+
+        Kept for backwards compatibility. Returns dict with keys
+        tldr / what_it_does / what_it_improves (empty strings on error).
+        """
         text = raw.strip()
-
-        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
-        if fence_match:
-            text = fence_match.group(1).strip()
-
+        fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if fence:
+            text = fence.group(1).strip()
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -173,28 +90,53 @@ class PaperAnalyzer:
                 "what_it_improves": "",
                 "error": f"Failed to parse LLM response: {raw[:200]}",
             }
-
         return {
             "tldr": str(data.get("tldr", "")).strip(),
             "what_it_does": str(data.get("what_it_does", "")).strip(),
             "what_it_improves": str(data.get("what_it_improves", "")).strip(),
         }
 
-    def analyze(self, pdf_path: str) -> Dict[str, str]:
+    def analyze(
+        self,
+        pdf_path: str,
+        run_id: Optional[str] = None,
+        resume_from: Optional[str] = None,
+        verbose: bool = False,
+    ) -> Dict[str, str]:
         """Extract text from a PDF and return a structured LLM analysis.
 
-        Returns a dict with keys: tldr, what_it_does, what_it_improves.
+        Args:
+            pdf_path: Path to the PDF file.
+            run_id: Stable cache identifier. Defaults to the PDF's stem.
+            resume_from: Pipeline step name to force-rerun from (e.g.
+                ``"classify_sections"``). Prior steps are loaded from cache.
+            verbose: Print step-by-step pipeline progress.
+
+        Returns:
+            Dict with keys: tldr, what_it_does, what_it_improves.
         """
         text = self.extract_text(pdf_path)
-        bound = self.prompt.render(text=text)
-        raw = self.llm.generate(prompt=bound["user"], system=bound["system"], format="json")
-        return self.parse_response(raw)
+        rid = run_id or Path(pdf_path).stem
+        ctx = self.pipeline.run(
+            self.llm,
+            initial_context={"raw_text": text},
+            cache_dir=self.cache_dir,
+            run_id=rid,
+            resume_from=resume_from,
+            verbose=verbose,
+        )
+        return {
+            "tldr": str(ctx.get("analyze.tldr", "")).strip(),
+            "what_it_does": str(ctx.get("analyze.what_it_does", "")).strip(),
+            "what_it_improves": str(ctx.get("analyze.what_it_improves", "")).strip(),
+        }
 
 
 if __name__ == "__main__":
     # Usage:
-    #   python -m PaperFoundry.analyzer [pdf] [model]            # full analysis
-    #   python -m PaperFoundry.analyzer [pdf] [model] --sections # section extractor only
+    #   python -m PaperFoundry.analyzer [pdf] [model]
+    #   python -m PaperFoundry.analyzer [pdf] [model] --verbose
+    #   python -m PaperFoundry.analyzer [pdf] [model] --resume-from classify_sections
     from .llm import LLMClient
 
     test_dir = Path(__file__).parent.parent / "test"
@@ -202,7 +144,12 @@ if __name__ == "__main__":
 
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
-    sections_mode = "--sections" in flags
+    verbose = "--verbose" in flags
+
+    resume_from = None
+    for flag in flags:
+        if flag.startswith("--resume-from="):
+            resume_from = flag.split("=", 1)[1]
 
     if not pdfs and not args:
         print(f"No PDFs found in {test_dir}")
@@ -216,49 +163,34 @@ if __name__ == "__main__":
         print(f"Available: {[p.name for p in pdfs]}\n")
 
     model = args[1] if len(args) > 1 else "gemma4:e2b"
+    max_chars = int(args[2]) if len(args) > 2 else None
+    cache_dir = Path(".papertrack_cache")
 
-    print(f"Model : {model}")
-    print(f"Paper : {pdf_path.name}")
-    print(f"Mode  : {'section extraction' if sections_mode else 'full analysis'}")
+    print(f"Model    : {model}")
+    print(f"Max chars: {max_chars or 'unlimited (no pagination)'}")
+    print(f"Paper    : {pdf_path.name}")
+    print(f"Cache    : {cache_dir / 'pipelines' / 'analyze_paper' / pdf_path.stem}")
+    if resume_from:
+        print(f"Resume   : from step {resume_from!r}")
     print("-" * 60)
 
     reader = pypdf.PdfReader(str(pdf_path))
     pages = [page.extract_text() or "" for page in reader.pages]
-    print(f"Pages : {len(pages)}  |  Raw chars: {sum(len(p) for p in pages)}")
+    raw_chars = sum(len(p) for p in pages)
+    print(f"Pages    : {len(pages)}  |  Raw chars: {raw_chars:,}")
 
-    client = LLMClient(model=model)
+    client = LLMClient(model=model, max_chars=max_chars)
     client.load(keep_alive="10m")
 
     try:
-        if sections_mode:
-            extractor = SectionExtractor(llm=client, verbose=True)
-            print("\n[detecting headers — paginated]\n")
-            headers = extractor.detect_headers(pages)
-            print(f"Headers found ({len(headers)}):")
-            for h in headers:
-                print(f"  • {h!r}")
-
-            print("\n[locating boundaries in full text]\n")
-            full_text = "\n\n".join(pages)
-            boundaries = extractor._find_boundaries(full_text, headers)
-            for pos, name in boundaries:
-                print(f"  offset {pos:6d} — {name!r}")
-
-            # print("\n[extracted text]\n")
-            # result_text = extractor.extract(pages, _DEFAULT_MAX_CHARS)
-            # print(f"Extracted: {len(result_text)} chars")
-            # print("-" * 60)
-            # print(result_text)
-        else:
-            analyzer = PaperAnalyzer(llm=client)
-            text = analyzer.extract_text(str(pdf_path))
-            bound = analyzer.prompt.render(text=text)
-            print(f"Text sent: {len(text)} chars")
-            raw = client.generate(prompt=bound["user"], system=bound["system"], format="json")
-            print(f"\n[raw LLM response]\n{raw}\n")
-            result = analyzer.parse_response(raw)
-            print("-" * 60)
-            for key, value in result.items():
-                print(f"\n[{key}]\n{value}")
+        analyzer = PaperAnalyzer(llm=client, cache_dir=cache_dir)
+        result = analyzer.analyze(
+            str(pdf_path),
+            resume_from=resume_from,
+            verbose=True,
+        )
+        print("-" * 60)
+        for key, value in result.items():
+            print(f"\n[{key}]\n{value}")
     finally:
         client.unload()

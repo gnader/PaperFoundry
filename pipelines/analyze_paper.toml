@@ -1,0 +1,21 @@
+[pipeline]
+name = "analyze_paper"
+description = "Detect sections, classify the most relevant ones, then analyze the paper"
+
+[[step]]
+name = "detect_sections"
+prompt = "section_detect"
+inputs  = { text = "$.raw_text" }
+outputs = ["sections"]
+
+[[step]]
+name = "classify_sections"
+prompt = "section_classify"
+inputs  = { sections = "$.detect_sections.sections" }
+outputs = ["key_sections"]
+
+[[step]]
+name = "analyze"
+prompt = "analyze"
+inputs  = { text = "$.raw_text", key_sections = "$.classify_sections.key_sections" }
+outputs = ["tldr", "what_it_does", "what_it_improves"]

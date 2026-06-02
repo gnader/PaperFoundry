@@ -84,9 +84,10 @@ class LLMClient:
         client.unload()
     """
 
-    def __init__(self, model: str, host: str = DEFAULT_HOST):
+    def __init__(self, model: str, host: str = DEFAULT_HOST, max_chars: Optional[int] = None):
         self.model = model
         self.host = host
+        self.max_chars = max_chars
         self._client = ollama.Client(host=host)
 
         # Validate: Ollama reachable?

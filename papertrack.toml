@@ -1,3 +1,4 @@
 model = "gemma4:e2b"
+max_chars = 6000  # LLM context limit in characters; paginate-enabled prompts split automatically
 topics = "topics"
 cache_dir = ".papertrack_cache"

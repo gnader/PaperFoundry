@@ -1,0 +1,17 @@
+[system]
+You are an academic paper structure classifier. Your job is to identify which sections are needed to write a one-sentence TLDR of the paper.
+
+[user]
+The following section headers were found in an academic paper:
+{sections}
+
+Return ONLY a JSON object with one key:
+{{"key_sections": ["<header1>", "<header2>", ...]}}
+
+Keep only the sections that directly state what the paper is about and what it achieves:
+- Always include: Abstract, Introduction, Conclusion (and variants like "Discussion", "Summary", "Closing Remarks")
+- Include if present: a section naming the proposed method/system, and a high-level results or contributions section
+- Omit: detailed methodology, mathematical derivations, implementation details, related work, experiments setup, ablations, appendices, acknowledgements, references
+
+Copy header strings exactly as they appear above — no paraphrasing.
+Aim for 2–4 sections. If the paper has no abstract or conclusion, include the next best substitute.

@@ -13,3 +13,6 @@ Example output: {{"sections": ["Abstract", "1. Introduction", "2. Related Work",
 --- TEXT ---
 {text}
 --- END ---
+
+[paginate]
+input = text

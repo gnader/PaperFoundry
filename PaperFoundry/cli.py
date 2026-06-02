@@ -343,6 +343,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     host = args.host or cfg.get("host", "http://localhost:11434")
     keep_alive = args.keep_alive or cfg.get("keep_alive", "30m")
     cache_dir = None if args.no_cache else Path(cfg.get("cache_dir", ".papertrack_cache"))
+    max_chars = cfg.get("max_chars")
     output_dir = Path(cfg.get("output_dir", "."))
 
     # --topic-list short-circuit (no model needed)
@@ -396,7 +397,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     from .llm import LLMClient
 
-    client = LLMClient(model=model, host=host)
+    client = LLMClient(model=model, host=host, max_chars=max_chars)
     ok, msg = client.load(keep_alive=keep_alive)
     if not ok:
         print(f"Failed to load model: {msg}", file=sys.stderr)

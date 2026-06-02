@@ -28,6 +28,8 @@ _EXPORTS = {
     "PaperAnalyzer": "analyzer",
     "Prompt": "prompt",
     "PromptLibrary": "prompt",
+    "Pipeline": "pipeline",
+    "PipelineStep": "pipeline",
 }
 
 __all__ = list(_EXPORTS.keys())
