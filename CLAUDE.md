@@ -28,7 +28,7 @@ import PaperFoundry
 from PaperFoundry import LLMClient, FastFilter, load_topics, PromptLibrary
 ```
 
-The package re-exports its primary public API at the top level via lazy attribute loading (`PaperFoundry/__init__.py`): `LLMClient`, `Paper`, `ArxivFetcher`, `LiteratureMonitor`, `Topic`, `load_topics`, `FastFilter`, `PaperAnalyzer`, `Pipeline`, `PipelineStep`, `Prompt`, `PromptLibrary`. Submodules are imported on first access.
+The package re-exports its primary public API at the top level via lazy attribute loading (`PaperFoundry/__init__.py`): `LLMClient`, `Paper`, `ArxivFetcher`, `LiteratureMonitor`, `Topic`, `load_topics`, `FastFilter`, `PaperAnalyzer`, `Pipeline`, `PipelineStep`, `Prompt`, `PromptLibrary`, `compress_pdf`. Submodules are imported on first access.
 
 ## Dependencies
 
@@ -47,7 +47,7 @@ The **Ollama service** must also be installed and running separately. On Windows
 
 ## Architecture
 
-Eight library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `prompt`, `pipeline`, `filter`, `analyzer`, `cli`. The fetch/filter pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. `cli` (exposed as the `papertrack` console_script and `python -m PaperFoundry`) is a thin orchestrator that wires fetch → filter → Markdown report. `pipeline` is the declarative prompt pipeline engine; `analyzer` wraps it for single-paper deep analysis (not wired into the CLI pipeline). User-facing content lives outside the package: `topics/*.md` (topic definitions), `pipelines/*.toml` (pipeline definitions), `papertrack.toml` (config), `.papertrack_cache/` (fetch + pipeline step caches).
+Nine library modules inside the `PaperFoundry/` package: `llm`, `monitor`, `topics`, `prompt`, `pipeline`, `filter`, `analyzer`, `cli`, `utils`. The fetch/filter pipeline is `PaperFoundry.monitor → papers.json → PaperFoundry.filter`, with `PaperFoundry.llm` injected as the scoring backend and `PaperFoundry.topics` providing the topic dataclass + markdown loader. `cli` (exposed as the `papertrack` console_script and `python -m PaperFoundry`) is a thin orchestrator that wires fetch → filter → Markdown report. `pipeline` is the declarative prompt pipeline engine; `analyzer` wraps it for single-paper deep analysis (not wired into the CLI pipeline). User-facing content lives outside the package: `topics/*.md` (topic definitions), `pipelines/*.toml` (pipeline definitions), `papertrack.toml` (config), `.papertrack_cache/` (fetch + pipeline step caches).
 
 ### `PaperFoundry/monitor.py` — arXiv feed monitor
 
@@ -187,3 +187,20 @@ Current prompts:
 Parsing rule: a section header is any line whose stripped form is exactly `[system]`, `[user]`, or `[paginate]`. Everything between two headers (or from a header to end-of-file) is that section's body, with surrounding whitespace stripped. Literal `{` / `}` in prompt bodies must be escaped as `{{` / `}}` (standard `string.Formatter` convention) — necessary when the prompt body contains JSON examples.
 
 Add additional prompt files and load them with `PromptLibrary().load("name")` or `Prompt.load("name")`.
+
+### `PaperFoundry/utils.py` — PDF compression
+
+`compress_pdf(src, dst=None, *, image_quality=75, max_dimension=1920, resolution_scale=100.0, use_ghostscript=True, gs_quality="screen")` — compresses a PDF in three stages:
+
+1. **pypdf pass** — rewrites the file, compresses content streams, removes duplicate/orphaned objects.
+2. **Image recompression** (requires `Pillow`) — re-encodes every raster image (including images nested inside Form XObjects) as JPEG at `image_quality`. Before encoding, each image is optionally downsampled: `resolution_scale` shrinks by a percentage (e.g. `50.0` = half dimensions), then `max_dimension` caps the longest side in pixels (`None` disables). Both constraints compose — scale runs first. Only replaces an image if the result is actually smaller. Handles `/DeviceRGB`, `/DeviceGray`, `/DeviceCMYK`, and `/ICCBased` colorspaces; `/Indexed` palette images are skipped.
+3. **Ghostscript pass** (optional) — feeds the result through `gs`/`gswin64c`. Silently skipped if Ghostscript is not on PATH. `gs_quality` presets: `"screen"` (72 dpi, default), `"ebook"` (150 dpi), `"printer"`` (300 dpi).
+
+`compress_pdf` is exported at the package level (`from PaperFoundry import compress_pdf`).
+
+Dev entry point:
+```bash
+python -m PaperFoundry.utils <input.pdf> [output.pdf] [quality=75] [max_dim=1920,0=off] [scale%=100]
+```
+
+Typical results: 65–95% size reduction depending on image content. Requires `pypdf`; `Pillow` is needed for the image recompression stage.

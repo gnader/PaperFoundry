@@ -30,6 +30,7 @@ _EXPORTS = {
     "PromptLibrary": "prompt",
     "Pipeline": "pipeline",
     "PipelineStep": "pipeline",
+    "compress_pdf": "utils",
 }
 
 __all__ = list(_EXPORTS.keys())
